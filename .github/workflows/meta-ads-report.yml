@@ -47,4 +47,4 @@ jobs:
           MODE: ${{ github.event.inputs.mode || 'daily' }}
           SINCE: ${{ github.event.inputs.since }}
           UNTIL: ${{ github.event.inputs.until }}
-        run: python scripts/meta_ads_report.py
+                run: python meta_ads_report_github.py
