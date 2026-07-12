@@ -21,6 +21,12 @@ TZ = pytz.timezone("America/Sao_Paulo")
 PIPELINE_ID = 11664299
 FOCO = ["Rayana", "Isadora", "Ana Lívia", "Isabella Eleutério"]
 
+ABA_PESSOA = "Relatório por Pessoa"
+ABA_BRUTO = "Números Brutos Diários"
+ABA_MIX = "Mix de Tipos por Pessoa"
+ABA_MOVIMENTACAO = "Movimentações por Etapa"
+ABA_LEADS_NOVOS = "Leads Novos por Dia"
+
 # ============================================================
 # JANELA: ONTEM (dinâmica, roda sozinha todo dia)
 # ============================================================
@@ -30,7 +36,7 @@ ts1 = int(TZ.localize(datetime.combine(ontem, time.max)).timestamp())
 print(f"Coletando dados de: {ontem}")
 
 # ============================================================
-# COLETA
+# COLETA: pipeline / status
 # ============================================================
 r = requests.get(f"{BASE_URL}/leads/pipelines/{PIPELINE_ID}", headers=HEADERS)
 r.raise_for_status()
@@ -83,8 +89,36 @@ def get_eventos():
     return ev
 
 
+def get_leads_novos():
+    """Leads criados no pipeline dentro da janela de 'ontem' (script 2)."""
+    leads, page = [], 1
+    while True:
+        params = {
+            "filter[created_at][from]": ts0,
+            "filter[created_at][to]": ts1,
+            "filter[pipeline_id]": PIPELINE_ID,
+            "page": page,
+            "limit": 250,
+        }
+        rr = requests.get(f"{BASE_URL}/leads", headers=HEADERS, params=params)
+        if rr.status_code == 204:
+            break
+        rr.raise_for_status()
+        d = rr.json().get("_embedded", {}).get("leads", [])
+        if not d:
+            break
+        leads.extend(d)
+        page += 1
+        if page > 500:
+            break
+    return leads
+
+
 eventos = get_eventos()
 print(f"{len(eventos)} eventos coletados.")
+
+leads_novos = get_leads_novos()
+print(f"{len(leads_novos)} leads novos criados ontem.")
 
 linhas = []
 for e in eventos:
@@ -117,19 +151,22 @@ if not df.empty:
     df = df[df["usuario"] != "User 0"]
 
 # ============================================================
-# RESUMO POR PESSOA (o que vai pra planilha)
+# RESUMOS
 # ============================================================
+resumo_pessoa_rows = []
+resumo_bruto_row = None
+mix_rows = []
+movimentacao_rows = []
+
 if df.empty:
-    print("Nenhum evento ontem. Nada a enviar.")
-    resumo_rows = []
+    print("Nenhum evento ontem.")
 else:
     foco_df = df[df.usuario.isin(FOCO)]
     mov = foco_df[foco_df.tipo == "lead_status_changed"]
 
-    # ações = total de eventos/interações (qualquer tipo)
+    # ---- Relatório por Pessoa ----
     acoes_totais = foco_df.groupby("usuario").size()
 
-    # leads = quantidade de leads ÚNICOS com quem a pessoa interagiu
     leads_df = foco_df[foco_df.entity_type == "lead"]
     leads_unicos = leads_df.groupby("usuario")["entity_id"].nunique()
 
@@ -137,9 +174,8 @@ else:
     compareceu = mov[mov.destino_etapa == "Compareceu (Ganho)"].groupby("usuario").size()
     faltou = mov[mov.destino_etapa == "Faltou (No Show)"].groupby("usuario").size()
 
-    resumo_rows = []
     for pessoa in FOCO:
-        resumo_rows.append(
+        resumo_pessoa_rows.append(
             [
                 str(ontem),
                 pessoa,
@@ -151,27 +187,82 @@ else:
             ]
         )
 
+    # ---- Números Brutos Diários (soma do grupo inteiro) ----
+    resumo_bruto_row = [
+        str(ontem),
+        int(leads_unicos.sum()),
+        int(acoes_totais.sum()),
+        int(agendou.sum()),
+        int(compareceu.sum()),
+        int(faltou.sum()),
+    ]
+
+    # ---- Mix de Tipos por Pessoa ----
+    if not foco_df.empty:
+        mix_counts = foco_df.groupby(["usuario", "tipo"]).size()
+        for (pessoa, tipo), qtd in mix_counts.items():
+            mix_rows.append([str(ontem), pessoa, tipo, int(qtd)])
+
+    # ---- Movimentações por Etapa (todas as etapas, não só as 3 principais) ----
+    if not mov.empty:
+        mov_counts = mov.groupby(["usuario", "destino_etapa"]).size()
+        for (pessoa, etapa), qtd in mov_counts.items():
+            movimentacao_rows.append([str(ontem), pessoa, etapa, int(qtd)])
+
+# ---- Leads Novos por Dia ----
+leads_novos_row = [str(ontem), len(leads_novos)]
+
 # ============================================================
-# ESCREVE NO GOOGLE SHEETS (acumula histórico)
+# ESCREVE NO GOOGLE SHEETS (cinco abas)
 # ============================================================
-if resumo_rows:
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    import json
 
-    creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDS), scopes=scopes)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SHEET_ID)
-    ws = sh.sheet1
 
-    cabecalho = ["data", "pessoa", "leads", "ações", "agendamentos", "compareceu", "faltou"]
+def get_or_create_ws(sh, titulo, cabecalho):
+    try:
+        ws = sh.worksheet(titulo)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=titulo, rows=1000, cols=max(10, len(cabecalho)))
 
-    # Checagem robusta: olha direto a célula A1 em vez de get_all_values(),
-    # que às vezes retorna algo "não-vazio" mesmo numa planilha em branco.
     primeira_celula = ws.acell("A1").value
     if not primeira_celula:
         ws.insert_row(cabecalho, index=1)
+    return ws
 
-    ws.append_rows(resumo_rows, value_input_option="USER_ENTERED")
-    print(f"{len(resumo_rows)} linhas enviadas para a planilha.")
-else:
-    print("Nada enviado.")
+
+scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+import json
+
+creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDS), scopes=scopes)
+gc = gspread.authorize(creds)
+sh = gc.open_by_key(SHEET_ID)
+
+cabecalho_pessoa = ["data", "pessoa", "leads", "ações", "agendamentos", "compareceu", "faltou"]
+cabecalho_bruto = ["data", "leads", "ações", "agendamentos", "compareceu", "faltou"]
+cabecalho_mix = ["data", "pessoa", "tipo_evento", "quantidade"]
+cabecalho_movimentacao = ["data", "pessoa", "etapa_destino", "quantidade"]
+cabecalho_leads_novos = ["data", "leads_novos"]
+
+ws_pessoa = get_or_create_ws(sh, ABA_PESSOA, cabecalho_pessoa)
+ws_bruto = get_or_create_ws(sh, ABA_BRUTO, cabecalho_bruto)
+ws_mix = get_or_create_ws(sh, ABA_MIX, cabecalho_mix)
+ws_movimentacao = get_or_create_ws(sh, ABA_MOVIMENTACAO, cabecalho_movimentacao)
+ws_leads_novos = get_or_create_ws(sh, ABA_LEADS_NOVOS, cabecalho_leads_novos)
+
+if resumo_pessoa_rows:
+    ws_pessoa.append_rows(resumo_pessoa_rows, value_input_option="USER_ENTERED")
+    print(f"{len(resumo_pessoa_rows)} linhas enviadas para '{ABA_PESSOA}'.")
+
+if resumo_bruto_row:
+    ws_bruto.append_row(resumo_bruto_row, value_input_option="USER_ENTERED")
+    print(f"1 linha enviada para '{ABA_BRUTO}'.")
+
+if mix_rows:
+    ws_mix.append_rows(mix_rows, value_input_option="USER_ENTERED")
+    print(f"{len(mix_rows)} linhas enviadas para '{ABA_MIX}'.")
+
+if movimentacao_rows:
+    ws_movimentacao.append_rows(movimentacao_rows, value_input_option="USER_ENTERED")
+    print(f"{len(movimentacao_rows)} linhas enviadas para '{ABA_MOVIMENTACAO}'.")
+
+ws_leads_novos.append_row(leads_novos_row, value_input_option="USER_ENTERED")
+print(f"1 linha enviada para '{ABA_LEADS_NOVOS}'.")
