@@ -1,0 +1,50 @@
+name: Meta Ads Report
+
+on:
+  schedule:
+    # 09:00 UTC = 06:00 America/Sao_Paulo
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'daily (dia anterior) ou backfill (intervalo customizado)'
+        required: true
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - backfill
+      since:
+        description: 'Data inicial YYYY-MM-DD (so para backfill)'
+        required: false
+        default: ''
+      until:
+        description: 'Data final YYYY-MM-DD (so para backfill)'
+        required: false
+        default: ''
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install requests gspread google-auth
+
+      - name: Rodar relatorio
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_IDS: ${{ secrets.META_AD_ACCOUNT_IDS }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          MODE: ${{ github.event.inputs.mode || 'daily' }}
+          SINCE: ${{ github.event.inputs.since }}
+          UNTIL: ${{ github.event.inputs.until }}
+        run: python scripts/meta_ads_report.py
