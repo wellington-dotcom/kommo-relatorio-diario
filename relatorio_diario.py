@@ -30,7 +30,7 @@ ts1 = int(TZ.localize(datetime.combine(ontem, time.max)).timestamp())
 print(f"Coletando dados de: {ontem}")
 
 # ============================================================
-# COLETA (igual ao seu script)
+# COLETA
 # ============================================================
 r = requests.get(f"{BASE_URL}/leads/pipelines/{PIPELINE_ID}", headers=HEADERS)
 r.raise_for_status()
@@ -91,6 +91,8 @@ for e in eventos:
     uid = e.get("created_by", 0)
     nome = usuarios.get(uid, f"User {uid}")
     tipo = e.get("type", "?")
+    entity_type = e.get("entity_type", "?")   # ex: "lead", "contact", "task"...
+    entity_id = e.get("entity_id")
     destino = None
     if tipo == "lead_status_changed":
         try:
@@ -102,6 +104,8 @@ for e in eventos:
         {
             "usuario": nome,
             "tipo": tipo,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
             "destino_etapa": destino,
             "data": dt.date(),
             "hora": dt.hour,
@@ -120,9 +124,15 @@ if df.empty:
     resumo_rows = []
 else:
     foco_df = df[df.usuario.isin(FOCO)]
-    mov = df[(df.tipo == "lead_status_changed") & (df.usuario.isin(FOCO))]
+    mov = foco_df[foco_df.tipo == "lead_status_changed"]
 
-    total_ev = foco_df.groupby("usuario").size()
+    # ações = total de eventos/interações (qualquer tipo)
+    acoes_totais = foco_df.groupby("usuario").size()
+
+    # leads = quantidade de leads ÚNICOS com quem a pessoa interagiu
+    leads_df = foco_df[foco_df.entity_type == "lead"]
+    leads_unicos = leads_df.groupby("usuario")["entity_id"].nunique()
+
     agendou = mov[mov.destino_etapa == "Agendamento Marcado"].groupby("usuario").size()
     compareceu = mov[mov.destino_etapa == "Compareceu (Ganho)"].groupby("usuario").size()
     faltou = mov[mov.destino_etapa == "Faltou (No Show)"].groupby("usuario").size()
@@ -133,7 +143,8 @@ else:
             [
                 str(ontem),
                 pessoa,
-                int(total_ev.get(pessoa, 0)),
+                int(leads_unicos.get(pessoa, 0)),
+                int(acoes_totais.get(pessoa, 0)),
                 int(agendou.get(pessoa, 0)),
                 int(compareceu.get(pessoa, 0)),
                 int(faltou.get(pessoa, 0)),
@@ -152,9 +163,13 @@ if resumo_rows:
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.sheet1
 
-    # cabeçalho, só na primeira vez
-    if not ws.get_all_values():
-        ws.append_row(["data", "pessoa", "eventos_totais", "agendamentos", "compareceu", "faltou"])
+    cabecalho = ["data", "pessoa", "leads", "ações", "agendamentos", "compareceu", "faltou"]
+
+    # Checagem robusta: olha direto a célula A1 em vez de get_all_values(),
+    # que às vezes retorna algo "não-vazio" mesmo numa planilha em branco.
+    primeira_celula = ws.acell("A1").value
+    if not primeira_celula:
+        ws.insert_row(cabecalho, index=1)
 
     ws.append_rows(resumo_rows, value_input_option="USER_ENTERED")
     print(f"{len(resumo_rows)} linhas enviadas para a planilha.")
