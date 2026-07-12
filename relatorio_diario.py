@@ -28,6 +28,7 @@ ABA_BRUTO = "Números Brutos Diários"
 ABA_MIX = "Mix de Tipos por Pessoa"
 ABA_MOVIMENTACAO = "Movimentações por Etapa"
 ABA_LEADS_NOVOS = "Leads Novos por Dia"
+ABA_TEMPO_RESPOSTA = "Tempo de Resposta"
 
 # ============================================================
 # TRADUÇÃO DE TIPOS DE EVENTO (nomes fixos do sistema Kommo)
@@ -207,6 +208,80 @@ print(f"{len(eventos)} eventos coletados hoje até agora.")
 leads_novos = get_leads_novos()
 print(f"{len(leads_novos)} leads novos hoje até agora.")
 
+
+# ============================================================
+# TEMPO DE RESPOSTA: primeira resposta de cada lead + média geral
+# ============================================================
+def calcular_tempos_resposta(eventos, usuarios):
+    """Retorna duas listas de (nome_pessoa, minutos):
+    - primeira_resposta: só a 1a mensagem recebida de cada lead -> 1a resposta enviada
+    - toda_resposta: cada mensagem recebida -> próxima resposta enviada (todas as trocas)
+    """
+    por_lead = {}
+    for e in eventos:
+        tipo = e.get("type")
+        if tipo not in ("incoming_chat_message", "outgoing_chat_message"):
+            continue
+        if e.get("entity_type") != "lead":
+            continue
+        lead_id = e.get("entity_id")
+        if lead_id is None:
+            continue
+        por_lead.setdefault(lead_id, []).append(e)
+
+    primeira_resposta = []
+    toda_resposta = []
+
+    for lead_id, evs in por_lead.items():
+        evs_ordenados = sorted(evs, key=lambda x: x["created_at"])
+        pendentes = []
+        primeira_ja_computada = False
+        for e in evs_ordenados:
+            tipo = e.get("type")
+            if tipo == "incoming_chat_message":
+                pendentes.append(e["created_at"])
+            elif tipo == "outgoing_chat_message":
+                if pendentes:
+                    uid = e.get("created_by", 0)
+                    nome = usuarios.get(uid, f"User {uid}")
+                    for t_in in pendentes:
+                        delta_min = (e["created_at"] - t_in) / 60
+                        toda_resposta.append((nome, delta_min))
+                    if not primeira_ja_computada:
+                        delta_primeira = (e["created_at"] - pendentes[0]) / 60
+                        primeira_resposta.append((nome, delta_primeira))
+                        primeira_ja_computada = True
+                    pendentes = []
+    return primeira_resposta, toda_resposta
+
+
+primeira_resposta, toda_resposta = calcular_tempos_resposta(eventos, usuarios)
+print(f"{len(primeira_resposta)} primeiras respostas e {len(toda_resposta)} respostas no total (todas as trocas).")
+
+primeira_por_pessoa = {}
+toda_por_pessoa = {}
+for nome, delta in primeira_resposta:
+    if nome in FOCO:
+        primeira_por_pessoa.setdefault(nome, []).append(delta)
+for nome, delta in toda_resposta:
+    if nome in FOCO:
+        toda_por_pessoa.setdefault(nome, []).append(delta)
+
+tempo_resposta_rows = []
+for pessoa in FOCO:
+    prim = primeira_por_pessoa.get(pessoa, [])
+    tod = toda_por_pessoa.get(pessoa, [])
+    tempo_resposta_rows.append(
+        [
+            str(hoje),
+            pessoa,
+            round(sum(prim) / len(prim), 1) if prim else 0,
+            len(prim),
+            round(sum(tod) / len(tod), 1) if tod else 0,
+            len(tod),
+        ]
+    )
+
 linhas = []
 for e in eventos:
     uid = e.get("created_by", 0)
@@ -330,7 +405,7 @@ def upsert_rows(ws, key_cols_count, rows):
     chave_para_linha = {}
     for i, linha_existente in enumerate(corpo):
         chave = tuple(linha_existente[:key_cols_count])
-        chave_para_linha[chave] = i + 2  # +1 cabeçalho, +1 índice base 1
+        chave_para_linha[chave] = i + 2
 
     atualizacoes = []
     novas = []
@@ -359,17 +434,24 @@ cabecalho_bruto = ["data", "leads", "ações", "agendamentos", "compareceu", "fa
 cabecalho_mix = ["data", "pessoa", "tipo_evento", "quantidade"]
 cabecalho_movimentacao = ["data", "pessoa", "etapa_destino", "quantidade"]
 cabecalho_leads_novos = ["data", "leads_novos"]
+cabecalho_tempo_resposta = [
+    "data", "pessoa",
+    "primeira_resposta_min", "qtd_primeiras_respostas",
+    "resposta_media_min", "qtd_respostas_totais",
+]
 
 ws_pessoa = get_or_create_ws(sh, ABA_PESSOA, cabecalho_pessoa)
 ws_bruto = get_or_create_ws(sh, ABA_BRUTO, cabecalho_bruto)
 ws_mix = get_or_create_ws(sh, ABA_MIX, cabecalho_mix)
 ws_movimentacao = get_or_create_ws(sh, ABA_MOVIMENTACAO, cabecalho_movimentacao)
 ws_leads_novos = get_or_create_ws(sh, ABA_LEADS_NOVOS, cabecalho_leads_novos)
+ws_tempo_resposta = get_or_create_ws(sh, ABA_TEMPO_RESPOSTA, cabecalho_tempo_resposta)
 
-upsert_rows(ws_pessoa, key_cols_count=2, rows=resumo_pessoa_rows)          # chave: data + pessoa
-upsert_rows(ws_bruto, key_cols_count=1, rows=[resumo_bruto_row])          # chave: data
-upsert_rows(ws_mix, key_cols_count=3, rows=mix_rows)                      # chave: data + pessoa + tipo
-upsert_rows(ws_movimentacao, key_cols_count=3, rows=movimentacao_rows)    # chave: data + pessoa + etapa
-upsert_rows(ws_leads_novos, key_cols_count=1, rows=[leads_novos_row])     # chave: data
+upsert_rows(ws_pessoa, key_cols_count=2, rows=resumo_pessoa_rows)
+upsert_rows(ws_bruto, key_cols_count=1, rows=[resumo_bruto_row])
+upsert_rows(ws_mix, key_cols_count=3, rows=mix_rows)
+upsert_rows(ws_movimentacao, key_cols_count=3, rows=movimentacao_rows)
+upsert_rows(ws_leads_novos, key_cols_count=1, rows=[leads_novos_row])
+upsert_rows(ws_tempo_resposta, key_cols_count=2, rows=tempo_resposta_rows)
 
 print(f"Atualizado com sucesso às {agora.strftime('%H:%M')} de {hoje}.")
