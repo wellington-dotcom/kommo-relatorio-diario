@@ -1,5 +1,6 @@
 import os
 import json
+import re
 
 import requests
 import pandas as pd
@@ -29,6 +30,13 @@ ABA_MIX = "Mix de Tipos por Pessoa"
 ABA_MOVIMENTACAO = "Movimentações por Etapa"
 ABA_LEADS_NOVOS = "Leads Novos por Dia"
 ABA_TEMPO_RESPOSTA = "Tempo de Resposta"
+ABA_LOG_LEADS = "Log de Movimentação de Leads"
+
+# Palavras-chave usadas pra achar sozinho qual campo personalizado guarda a
+# data/hora do agendamento. Se a coluna "horario_agendamento" sair vazia,
+# veja o print "Campos identificados como agendamento" no início da execução
+# e ajuste esta lista com o nome exato do campo cadastrado no Kommo.
+PALAVRAS_CHAVE_AGENDAMENTO = ["agendamento", "consulta marcada", "data e hora", "horário marcado", "atendimento"]
 
 # ============================================================
 # TRADUÇÃO DE TIPOS DE EVENTO (nomes fixos do sistema Kommo)
@@ -90,20 +98,23 @@ ts1 = int(agora.timestamp())
 print(f"Coletando dados de hoje ({hoje}) até {agora.strftime('%H:%M')}")
 
 # ============================================================
-# COLETA: status de TODOS os pipelines (corrige o bug do "?")
+# COLETA: status E nome de TODOS os pipelines (corrige o bug do "?" e
+# agora também identifica o funil de cada lead, pra coluna 'funil')
 # ============================================================
-def get_todos_status():
+def get_pipelines_e_status():
     status_map = {}
+    pipeline_nomes = {}
     rr = requests.get(f"{BASE_URL}/leads/pipelines", headers=HEADERS)
     rr.raise_for_status()
     pipelines = rr.json().get("_embedded", {}).get("pipelines", [])
     for p in pipelines:
+        pipeline_nomes[p["id"]] = p.get("name", f"Funil {p['id']}")
         for s in p.get("_embedded", {}).get("statuses", []):
             status_map[s["id"]] = s["name"]
-    return status_map
+    return status_map, pipeline_nomes
 
 
-STATUS = get_todos_status()
+STATUS, PIPELINE_NOMES = get_pipelines_e_status()
 
 
 def get_custom_fields():
@@ -130,6 +141,26 @@ def get_custom_fields():
 
 
 CAMPOS_PERSONALIZADOS = get_custom_fields()
+
+
+def detectar_campos_agendamento(campos_personalizados):
+    encontrados = {}
+    for campo_id, nome in campos_personalizados.items():
+        nome_lower = nome.lower()
+        if any(p in nome_lower for p in PALAVRAS_CHAVE_AGENDAMENTO):
+            encontrados[campo_id] = nome
+    return encontrados
+
+
+CAMPOS_AGENDAMENTO = detectar_campos_agendamento(CAMPOS_PERSONALIZADOS)
+if CAMPOS_AGENDAMENTO:
+    print(f"Campos identificados como agendamento: {list(CAMPOS_AGENDAMENTO.values())}")
+else:
+    print(
+        "Nenhum campo de agendamento identificado automaticamente — a coluna "
+        "'horario_agendamento' vai ficar vazia. Ajuste PALAVRAS_CHAVE_AGENDAMENTO "
+        "com o nome exato do campo cadastrado no Kommo."
+    )
 
 
 def get_usuarios():
@@ -202,11 +233,189 @@ def get_leads_novos():
     return leads
 
 
+def chunk(lista, tamanho):
+    lista = list(lista)
+    for i in range(0, len(lista), tamanho):
+        yield lista[i:i + tamanho]
+
+
+def get_leads_por_id(lead_ids):
+    """Busca leads em lote (nome, pipeline_id, campos personalizados, contato
+    principal) — usado pra montar o log detalhado de mudança de etapa."""
+    leads_map = {}
+    for grupo in chunk(sorted(set(lid for lid in lead_ids if lid)), 200):
+        page = 1
+        while True:
+            query = [("with", "contacts"), ("limit", 250), ("page", page)]
+            query += [("filter[id][]", lid) for lid in grupo]
+            rr = requests.get(f"{BASE_URL}/leads", headers=HEADERS, params=query)
+            if rr.status_code == 204:
+                break
+            rr.raise_for_status()
+            d = rr.json().get("_embedded", {}).get("leads", [])
+            if not d:
+                break
+            for lead in d:
+                leads_map[lead["id"]] = lead
+            if len(d) < 250:
+                break
+            page += 1
+    return leads_map
+
+
+def get_contatos_por_id(contato_ids):
+    """Busca contatos em lote — usado pra pegar o telefone."""
+    contatos_map = {}
+    for grupo in chunk(sorted(set(cid for cid in contato_ids if cid)), 200):
+        page = 1
+        while True:
+            query = [("limit", 250), ("page", page)]
+            query += [("filter[id][]", cid) for cid in grupo]
+            rr = requests.get(f"{BASE_URL}/contacts", headers=HEADERS, params=query)
+            if rr.status_code == 204:
+                break
+            rr.raise_for_status()
+            d = rr.json().get("_embedded", {}).get("contacts", [])
+            if not d:
+                break
+            for contato in d:
+                contatos_map[contato["id"]] = contato
+            if len(d) < 250:
+                break
+            page += 1
+    return contatos_map
+
+
+def contato_principal_id(lead):
+    contatos = lead.get("_embedded", {}).get("contacts", [])
+    if not contatos:
+        return None
+    for c in contatos:
+        if c.get("is_main"):
+            return c["id"]
+    return contatos[0]["id"]
+
+
+def normalizar_telefone(bruto):
+    """Normaliza telefone BR pra '+55 (DD) 9XXXX-XXXX'. Quando o número de
+    dígitos não bate com DDD+celular(9) nem DDD+fixo(8) — ex: veio sem DDD,
+    é um número internacional, ou tem lixo digitado — devolve os dígitos
+    limpos prefixados com '?' pra você identificar na planilha em vez de
+    arriscar formatar errado."""
+    if not bruto:
+        return ""
+    digitos = re.sub(r"\D", "", str(bruto))
+    if not digitos:
+        return ""
+
+    if digitos.startswith("55") and len(digitos) in (12, 13):
+        digitos = digitos[2:]
+
+    if len(digitos) == 11:
+        ddd, numero = digitos[:2], digitos[2:]
+        return f"+55 ({ddd}) {numero[:5]}-{numero[5:]}"
+    if len(digitos) == 10:
+        ddd, numero = digitos[:2], digitos[2:]
+        return f"+55 ({ddd}) {numero[:4]}-{numero[4:]}"
+
+    return f"? {digitos}"
+
+
+def extrair_telefone(contato):
+    if not contato:
+        return ""
+    numeros = []
+    for cfv in contato.get("custom_fields_values") or []:
+        if cfv.get("field_code") == "PHONE":
+            for v in cfv.get("values") or []:
+                valor = v.get("value")
+                if valor:
+                    numeros.append(normalizar_telefone(valor))
+    return ", ".join(numeros)
+
+
+def formatar_valor_agendamento(bruto):
+    if bruto is None or bruto == "":
+        return ""
+    try:
+        ts = int(bruto)
+        if ts > 10 ** 8:  # parece timestamp Unix, não um texto/número comum
+            return datetime.fromtimestamp(ts, TZ).strftime("%d/%m/%Y %H:%M")
+    except (ValueError, TypeError):
+        pass
+    return str(bruto)
+
+
+def extrair_horario_agendamento(lead, campos_agendamento):
+    for cfv in lead.get("custom_fields_values") or []:
+        if cfv.get("field_id") in campos_agendamento:
+            valores = cfv.get("values") or []
+            if valores:
+                return formatar_valor_agendamento(valores[0].get("value"))
+    return ""
+
+
 eventos = get_eventos()
 print(f"{len(eventos)} eventos coletados hoje até agora.")
 
 leads_novos = get_leads_novos()
 print(f"{len(leads_novos)} leads novos hoje até agora.")
+
+
+# ============================================================
+# LOG DETALHADO: nome, telefone, funil e etapa de cada lead que mudou de
+# etapa hoje — junto com o horário do agendamento, quando existir
+# ============================================================
+mudancas_etapa = [
+    e for e in eventos
+    if e.get("type") == "lead_status_changed" and e.get("entity_type") == "lead"
+]
+lead_ids_hoje = {e.get("entity_id") for e in mudancas_etapa}
+
+leads_info = get_leads_por_id(lead_ids_hoje)
+contato_ids_hoje = {contato_principal_id(lead) for lead in leads_info.values()}
+contatos_info = get_contatos_por_id(contato_ids_hoje)
+
+log_leads_rows = []
+for e in mudancas_etapa:
+    lead_id = e.get("entity_id")
+    lead = leads_info.get(lead_id, {})
+    contato = contatos_info.get(contato_principal_id(lead), {})
+
+    uid = e.get("created_by", 0)
+    responsavel = usuarios.get(uid, f"User {uid}")
+
+    status_depois_id = status_antes_id = None
+    try:
+        status_depois_id = e["value_after"][0]["lead_status"]["id"]
+    except (IndexError, KeyError, TypeError):
+        pass
+    try:
+        status_antes_id = e["value_before"][0]["lead_status"]["id"]
+    except (IndexError, KeyError, TypeError):
+        pass
+
+    etapa_destino = STATUS.get(status_depois_id, "Etapa não identificada")
+    etapa_anterior = STATUS.get(status_antes_id, "") if status_antes_id else ""
+    funil = PIPELINE_NOMES.get(lead.get("pipeline_id"), "Funil não identificado")
+    dt_evento = datetime.fromtimestamp(e["created_at"], TZ)
+
+    log_leads_rows.append(
+        [
+            str(e["id"]),
+            dt_evento.strftime("%d/%m/%Y %H:%M"),
+            str(lead_id),
+            lead.get("name", ""),
+            extrair_telefone(contato),
+            funil,
+            etapa_destino,
+            etapa_anterior,
+            responsavel,
+            extrair_horario_agendamento(lead, CAMPOS_AGENDAMENTO),
+        ]
+    )
+
+print(f"{len(log_leads_rows)} mudanças de etapa detalhadas hoje (nome, telefone, funil e agendamento).")
 
 
 # ============================================================
@@ -453,6 +662,10 @@ cabecalho_tempo_resposta = [
     "primeira_resposta_min (7h-19h)", "qtd_primeiras_respostas",
     "resposta_media_min (7h-19h)", "qtd_respostas_totais",
 ]
+cabecalho_log_leads = [
+    "evento_id", "data_hora", "lead_id", "nome_do_lead", "telefone",
+    "funil", "etapa_destino", "etapa_anterior", "responsavel", "horario_agendamento",
+]
 
 ws_pessoa = get_or_create_ws(sh, ABA_PESSOA, cabecalho_pessoa)
 ws_bruto = get_or_create_ws(sh, ABA_BRUTO, cabecalho_bruto)
@@ -460,6 +673,7 @@ ws_mix = get_or_create_ws(sh, ABA_MIX, cabecalho_mix)
 ws_movimentacao = get_or_create_ws(sh, ABA_MOVIMENTACAO, cabecalho_movimentacao)
 ws_leads_novos = get_or_create_ws(sh, ABA_LEADS_NOVOS, cabecalho_leads_novos)
 ws_tempo_resposta = get_or_create_ws(sh, ABA_TEMPO_RESPOSTA, cabecalho_tempo_resposta)
+ws_log_leads = get_or_create_ws(sh, ABA_LOG_LEADS, cabecalho_log_leads)
 
 upsert_rows(ws_pessoa, key_cols_count=2, rows=resumo_pessoa_rows)
 upsert_rows(ws_bruto, key_cols_count=1, rows=[resumo_bruto_row])
@@ -467,5 +681,6 @@ upsert_rows(ws_mix, key_cols_count=3, rows=mix_rows)
 upsert_rows(ws_movimentacao, key_cols_count=3, rows=movimentacao_rows)
 upsert_rows(ws_leads_novos, key_cols_count=1, rows=[leads_novos_row])
 upsert_rows(ws_tempo_resposta, key_cols_count=2, rows=tempo_resposta_rows)
+upsert_rows(ws_log_leads, key_cols_count=1, rows=log_leads_rows)
 
 print(f"Atualizado com sucesso às {agora.strftime('%H:%M')} de {hoje}.")
