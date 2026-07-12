@@ -331,7 +331,14 @@ def extrair_telefone(contato):
                 valor = v.get("value")
                 if valor:
                     numeros.append(normalizar_telefone(valor))
-    return ", ".join(numeros)
+    texto = ", ".join(numeros)
+    if not texto:
+        return ""
+    # apóstrofo na frente força o Google Sheets a gravar como TEXTO puro.
+    # Sem isso, USER_ENTERED tenta interpretar "+55 (...)" como fórmula
+    # (o "+" no início dispara o parser) e a célula vira #ERROR!.
+    # O apóstrofo some sozinho do valor exibido — não aparece na planilha.
+    return f"'{texto}"
 
 
 def formatar_valor_agendamento(bruto):
