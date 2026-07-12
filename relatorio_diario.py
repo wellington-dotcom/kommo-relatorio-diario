@@ -255,8 +255,22 @@ def calcular_tempos_resposta(eventos, usuarios):
     return primeira_resposta, toda_resposta
 
 
-primeira_resposta, toda_resposta = calcular_tempos_resposta(eventos, usuarios)
-print(f"{len(primeira_resposta)} primeiras respostas e {len(toda_resposta)} respostas no total (todas as trocas).")
+HORA_INICIO_COMERCIAL = 7
+HORA_FIM_COMERCIAL = 19  # até 18:59, não conta 19:00 em diante
+
+
+def dentro_do_horario_comercial(e):
+    dt = datetime.fromtimestamp(e["created_at"], TZ)
+    return HORA_INICIO_COMERCIAL <= dt.hour < HORA_FIM_COMERCIAL
+
+
+eventos_horario_comercial = [e for e in eventos if dentro_do_horario_comercial(e)]
+
+primeira_resposta, toda_resposta = calcular_tempos_resposta(eventos_horario_comercial, usuarios)
+print(
+    f"{len(primeira_resposta)} primeiras respostas e {len(toda_resposta)} respostas no total "
+    f"(considerando só mensagens entre {HORA_INICIO_COMERCIAL}h e {HORA_FIM_COMERCIAL}h)."
+)
 
 primeira_por_pessoa = {}
 toda_por_pessoa = {}
@@ -436,8 +450,8 @@ cabecalho_movimentacao = ["data", "pessoa", "etapa_destino", "quantidade"]
 cabecalho_leads_novos = ["data", "leads_novos"]
 cabecalho_tempo_resposta = [
     "data", "pessoa",
-    "primeira_resposta_min", "qtd_primeiras_respostas",
-    "resposta_media_min", "qtd_respostas_totais",
+    "primeira_resposta_min (7h-19h)", "qtd_primeiras_respostas",
+    "resposta_media_min (7h-19h)", "qtd_respostas_totais",
 ]
 
 ws_pessoa = get_or_create_ws(sh, ABA_PESSOA, cabecalho_pessoa)
