@@ -5,6 +5,9 @@ on:
     - cron: "0 9 * * *" # todo dia às 09:00 UTC (~06:00 em Brasília)
   workflow_dispatch: {} # permite rodar manualmente pelo GitHub
 
+permissions:
+  contents: write # necessário para o passo de commit/push do creative_map.json
+
 jobs:
   sync:
     runs-on: ubuntu-latest
