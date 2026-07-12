@@ -1,11 +1,12 @@
 import os
 import json
+import calendar
 from collections import Counter
 
 import requests
 import pandas as pd
 import pytz
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, date, time
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -31,15 +32,30 @@ ABA_MOVIMENTACAO = "Movimentações por Etapa"
 ABA_LEADS_NOVOS = "Leads Novos por Dia"
 
 # ============================================================
-# JANELA: 1º de julho até ONTEM (hoje ainda não fechou o dia)
+# JANELA: mês escolhido no "Run workflow" (ANO / MES), com fallback
+# pro mês atual se rodar direto sem preencher nada
 # ============================================================
 hoje = datetime.now(TZ).date()
-data_inicio = hoje.replace(day=1)          # ajuste aqui se quiser outro mês/ano
-data_fim = hoje - timedelta(days=1)
+ano = int(os.environ.get("ANO", hoje.year))
+mes = int(os.environ.get("MES", hoje.month))
+
+data_inicio = date(ano, mes, 1)
+ultimo_dia_calendario = calendar.monthrange(ano, mes)[1]
+data_fim_calendario = date(ano, mes, ultimo_dia_calendario)
+
+if ano == hoje.year and mes == hoje.month:
+    # mês corrente: não processa hoje (dia ainda não fechou) nem dias futuros
+    data_fim = min(data_fim_calendario, hoje - timedelta(days=1))
+else:
+    data_fim = data_fim_calendario
+
+if data_fim < data_inicio:
+    print(f"Nada a processar: {ano}-{mes:02d} ainda não teve nenhum dia fechado.")
+    raise SystemExit(0)
 
 ts0 = int(TZ.localize(datetime.combine(data_inicio, time.min)).timestamp())
 ts1 = int(TZ.localize(datetime.combine(data_fim, time.max)).timestamp())
-print(f"Backfill de {data_inicio} até {data_fim}")
+print(f"Backfill de {data_inicio} até {data_fim} (mês {mes:02d}/{ano})")
 
 # ============================================================
 # COLETA: pipeline / status / usuários
@@ -280,4 +296,4 @@ if movimentacao_rows:
 if leads_novos_rows:
     ws_leads_novos.append_rows(leads_novos_rows, value_input_option="USER_ENTERED")
 
-print("Backfill concluído — confira as abas na planilha.")
+print(f"Backfill de {mes:02d}/{ano} concluído — confira as abas na planilha.")
