@@ -53,11 +53,11 @@ def fetch_ads(account_id):
                 "status",
                 "campaign{id,name}",
                 "adset{id,name}",
-                "creative{id,name,thumbnail_url,image_url,video_id,object_story_spec}",
+                "creative{id,name,thumbnail_url,image_url,video_id}",
             ]
         ),
         "effective_status": json.dumps(["ACTIVE", "PAUSED"]),
-        "limit": 200,
+        "limit": 50,
     }
 
     ads = []
