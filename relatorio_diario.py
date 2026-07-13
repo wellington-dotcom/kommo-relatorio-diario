@@ -13,7 +13,7 @@ from google.oauth2.service_account import Credentials
 # ============================================================
 # CONFIG (vem das "Secrets" do GitHub, NUNCA escrito aqui direto)
 # ============================================================
-SUBDOMINIO = "isapaulaeleuterio"
+SUBDOMINIO = os.environ["KOMMO_SUBDOMAIN"]
 TOKEN = os.environ["KOMMO_TOKEN"]
 SHEET_ID = os.environ["SHEET_ID"]
 GOOGLE_CREDS = os.environ["GOOGLE_CREDENTIALS"]
