@@ -484,33 +484,10 @@ eventos_horario_comercial = [e for e in eventos if dentro_do_horario_comercial(e
 
 primeira_resposta, toda_resposta = calcular_tempos_resposta(eventos_horario_comercial, usuarios)
 print(
-    f"{len(primeira_resposta)} primeiras respostas e {len(toda_resposta)} respostas no total "
-    f"(considerando só mensagens entre {HORA_INICIO_COMERCIAL}h e {HORA_FIM_COMERCIAL}h)."
+    f"{len(primeira_resposta)} primeiras respostas e {len(toda_resposta)} respostas hoje no total "
+    f"(considerando só mensagens entre {HORA_INICIO_COMERCIAL}h e {HORA_FIM_COMERCIAL}h) — "
+    f"a aba 'Tempo de Resposta' grava só o delta desde o último lançamento, calculado mais abaixo."
 )
-
-primeira_por_pessoa = {}
-toda_por_pessoa = {}
-for nome, delta in primeira_resposta:
-    if nome in FOCO:
-        primeira_por_pessoa.setdefault(nome, []).append(delta)
-for nome, delta in toda_resposta:
-    if nome in FOCO:
-        toda_por_pessoa.setdefault(nome, []).append(delta)
-
-tempo_resposta_rows = []
-for pessoa in FOCO:
-    prim = primeira_por_pessoa.get(pessoa, [])
-    tod = toda_por_pessoa.get(pessoa, [])
-    tempo_resposta_rows.append(
-        [
-            str(hoje),
-            pessoa,
-            round(sum(prim) / len(prim), 1) if prim else 0,
-            len(prim),
-            round(sum(tod) / len(tod), 1) if tod else 0,
-            len(tod),
-        ]
-    )
 
 linhas = []
 for e in eventos:
@@ -623,15 +600,36 @@ def col_letter(n):
     return letras
 
 
+def texto_sheets(valor):
+    """Prefixo de apóstrofo força o Google Sheets a gravar como TEXTO puro
+    (mesmo truque já usado em extrair_telefone) — evita que uma data como
+    '2026-07-13' seja reinterpretada e reformatada (ex: 'segunda-feira, 13
+    de julho de 2026'), o que quebrava a comparação de chave a cada nova
+    rodada. O apóstrofo não aparece no valor exibido nem no que é lido de
+    volta com get_all_values()."""
+    return f"'{valor}"
+
+
+def _forcar_texto_na_data(row):
+    """Aplica texto_sheets() só na primeira coluna (sempre a data/chave)."""
+    nova = list(row)
+    if nova:
+        nova[0] = texto_sheets(nova[0])
+    return nova
+
+
 def upsert_rows(ws, key_cols_count, rows):
     """Atualiza linhas cuja chave (primeiras `key_cols_count` colunas) já existe;
     cria linha nova quando a chave ainda não apareceu hoje.
 
-    Duas otimizações pra não estourar a cota de escrita do Google Sheets:
-    1) Se o conteúdo da linha já é idêntico ao que está na planilha, não
+    Três cuidados pra não estourar a cota de escrita do Google Sheets nem
+    quebrar a comparação de chave:
+    1) A primeira coluna (data) é gravada como texto puro — senão o Sheets
+       reformata a célula e a chave nunca mais bate na rodada seguinte.
+    2) Se o conteúdo da linha já é idêntico ao que está na planilha, não
        escreve nada (a maioria dos eventos antigos do log não muda mais).
-    2) As atualizações que sobrarem vão todas num único batch_update,
-       em vez de uma chamada de API por linha."""
+    3) As atualizações que sobrarem vão todas num único batch_update, em
+       vez de uma chamada de API por linha."""
     if not rows:
         return
 
@@ -661,13 +659,78 @@ def upsert_rows(ws, key_cols_count, rows):
 
     if atualizacoes:
         lote = [
-            {"range": f"A{numero_linha}:{col_letter(len(valores))}{numero_linha}", "values": [valores]}
+            {
+                "range": f"A{numero_linha}:{col_letter(len(valores))}{numero_linha}",
+                "values": [_forcar_texto_na_data(valores)],
+            }
             for numero_linha, valores in atualizacoes
         ]
         ws.batch_update(lote, value_input_option="USER_ENTERED")
 
     if novas:
+        novas_texto = [_forcar_texto_na_data(r) for r in novas]
+        ws.append_rows(novas_texto, value_input_option="USER_ENTERED")
+
+
+def gravar_delta_log(ws, key_cols_count, rows_cumulativos_hoje):
+    """Pra métricas que devem virar um LOG (várias linhas por dia, uma por
+    rodada) em vez de upsert: grava só a diferença desde o último
+    lançamento de hoje. Soma o que já foi logado hoje pra cada chave,
+    subtrai do valor cumulativo atual (calculado desde a meia-noite), e
+    acrescenta uma linha nova só com o delta. Some as linhas na planilha
+    pra ter o total do dia — sem risco de contar o mesmo evento 2x."""
+    if not rows_cumulativos_hoje:
+        return
+
+    existentes = ws.get_all_values()
+    corpo = existentes[1:] if len(existentes) > 1 else []
+    hoje_str = str(hoje)
+
+    ja_logado_hoje = {}
+    for linha in corpo:
+        if len(linha) <= key_cols_count or linha[0] != hoje_str:
+            continue
+        chave = tuple(linha[:key_cols_count])
+        try:
+            valor = int(linha[key_cols_count])
+        except (ValueError, IndexError):
+            valor = 0
+        ja_logado_hoje[chave] = ja_logado_hoje.get(chave, 0) + valor
+
+    novas = []
+    for row in rows_cumulativos_hoje:
+        chave = tuple(str(v) for v in row[:key_cols_count])
+        cumulativo_agora = row[key_cols_count]
+        delta = cumulativo_agora - ja_logado_hoje.get(chave, 0)
+        if delta > 0:
+            nova_linha = list(row)
+            nova_linha[key_cols_count] = delta
+            novas.append(_forcar_texto_na_data(nova_linha))
+        # delta <= 0 -> nada novo pra essa chave desde a última rodada
+
+    if novas:
         ws.append_rows(novas, value_input_option="USER_ENTERED")
+
+
+def ultimo_timestamp_logado(ws, formato_data_hora, ts_fallback):
+    """Acha o timestamp (epoch) do último lançamento já gravado numa aba de
+    log incremental (lê só a 1a coluna, no formato `formato_data_hora`).
+    Se não achar nenhuma linha nesse formato ainda, usa `ts_fallback`
+    (meia-noite de hoje) — cobre o primeiro lançamento do dia."""
+    existentes = ws.get_all_values()
+    corpo = existentes[1:] if len(existentes) > 1 else []
+    maior_ts = None
+    for linha in corpo:
+        if not linha or not linha[0]:
+            continue
+        try:
+            dt = TZ.localize(datetime.strptime(linha[0], formato_data_hora))
+        except ValueError:
+            continue
+        ts = int(dt.timestamp())
+        if maior_ts is None or ts > maior_ts:
+            maior_ts = ts
+    return maior_ts if maior_ts is not None else ts_fallback
 
 
 scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -681,7 +744,7 @@ cabecalho_mix = ["data", "pessoa", "tipo_evento", "quantidade"]
 cabecalho_movimentacao = ["data", "pessoa", "etapa_destino", "quantidade"]
 cabecalho_leads_novos = ["data", "leads_novos"]
 cabecalho_tempo_resposta = [
-    "data", "pessoa",
+    "data_hora_lancamento", "pessoa",
     "primeira_resposta_min (7h-19h)", "qtd_primeiras_respostas",
     "resposta_media_min (7h-19h)", "qtd_respostas_totais",
 ]
@@ -698,12 +761,60 @@ ws_leads_novos = get_or_create_ws(sh, ABA_LEADS_NOVOS, cabecalho_leads_novos)
 ws_tempo_resposta = get_or_create_ws(sh, ABA_TEMPO_RESPOSTA, cabecalho_tempo_resposta)
 ws_log_leads = get_or_create_ws(sh, ABA_LOG_LEADS, cabecalho_log_leads)
 
+# ============================================================
+# TEMPO DE RESPOSTA — vira log incremental: cada linha traz DATA+HORA do
+# lançamento e as estatísticas de só o período desde o lançamento anterior
+# (não mais o acumulado do dia inteiro). Isso deixa claro a que janela de
+# tempo cada linha se refere, e você soma/pondera na planilha como quiser.
+# ============================================================
+FORMATO_DATA_HORA_LOG = "%d/%m/%Y %H:%M"
+ultimo_log_ts_resposta = ultimo_timestamp_logado(ws_tempo_resposta, FORMATO_DATA_HORA_LOG, ts_fallback=ts0)
+eventos_desde_ultimo_log = [e for e in eventos_horario_comercial if e["created_at"] > ultimo_log_ts_resposta]
+
+primeira_resposta_janela, toda_resposta_janela = calcular_tempos_resposta(eventos_desde_ultimo_log, usuarios)
+
+primeira_por_pessoa_janela = {}
+toda_por_pessoa_janela = {}
+for nome, delta in primeira_resposta_janela:
+    if nome in FOCO:
+        primeira_por_pessoa_janela.setdefault(nome, []).append(delta)
+for nome, delta in toda_resposta_janela:
+    if nome in FOCO:
+        toda_por_pessoa_janela.setdefault(nome, []).append(delta)
+
+data_hora_log = agora.strftime(FORMATO_DATA_HORA_LOG)
+tempo_resposta_rows = []
+for pessoa in FOCO:
+    prim = primeira_por_pessoa_janela.get(pessoa, [])
+    tod = toda_por_pessoa_janela.get(pessoa, [])
+    if not prim and not tod:
+        continue  # nada de novo pra essa pessoa desde o último lançamento -> não grava linha vazia
+    tempo_resposta_rows.append(
+        [
+            data_hora_log,
+            pessoa,
+            round(sum(prim) / len(prim), 1) if prim else 0,
+            len(prim),
+            round(sum(tod) / len(tod), 1) if tod else 0,
+            len(tod),
+        ]
+    )
+
+if tempo_resposta_rows:
+    ws_tempo_resposta.append_rows(
+        [_forcar_texto_na_data(r) for r in tempo_resposta_rows],
+        value_input_option="USER_ENTERED",
+    )
+print(
+    f"{len(tempo_resposta_rows)} linha(s) de tempo de resposta gravadas "
+    f"(janela desde {datetime.fromtimestamp(ultimo_log_ts_resposta, TZ).strftime(FORMATO_DATA_HORA_LOG)})."
+)
+
 upsert_rows(ws_pessoa, key_cols_count=2, rows=resumo_pessoa_rows)
 upsert_rows(ws_bruto, key_cols_count=1, rows=[resumo_bruto_row])
-upsert_rows(ws_mix, key_cols_count=3, rows=mix_rows)
+gravar_delta_log(ws_mix, key_cols_count=3, rows_cumulativos_hoje=mix_rows)
 upsert_rows(ws_movimentacao, key_cols_count=3, rows=movimentacao_rows)
 upsert_rows(ws_leads_novos, key_cols_count=1, rows=[leads_novos_row])
-upsert_rows(ws_tempo_resposta, key_cols_count=2, rows=tempo_resposta_rows)
 upsert_rows(ws_log_leads, key_cols_count=1, rows=log_leads_rows)
 
 print(f"Atualizado com sucesso às {agora.strftime('%H:%M')} de {hoje}.")
