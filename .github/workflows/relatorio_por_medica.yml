@@ -1,0 +1,24 @@
+name: Gasto e Leads por Médica
+
+on:
+  schedule:
+    - cron: "30 11 * * *" # roda depois do Meta Ads Report
+  workflow_dispatch: {}
+
+jobs:
+  relatorio:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependências
+        run: pip install gspread google-auth
+      - name: Rodar relatório por médica
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python relatorio_por_medica.py
