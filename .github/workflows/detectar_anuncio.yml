@@ -1,0 +1,22 @@
+name: Detectar leads de anúncio
+
+on:
+  repository_dispatch:
+    types: [kommo_message]
+
+jobs:
+  detectar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependências
+        run: pip install requests
+      - name: Detectar menção a anúncio e marcar lead
+        env:
+          KOMMO_SUBDOMAIN: ${{ secrets.KOMMO_SUBDOMAIN }}
+          KOMMO_TOKEN: ${{ secrets.KOMMO_TOKEN }}
+        run: |
+          python detectar_anuncio.py '${{ toJson(github.event.client_payload) }}'
