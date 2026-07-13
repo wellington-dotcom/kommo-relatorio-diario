@@ -32,4 +32,4 @@ jobs:
           KOMMO_TOKEN: ${{ secrets.KOMMO_TOKEN }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-        run: python backfill_por mês .py
+        run: python backfill_por_mes.py
