@@ -625,7 +625,13 @@ def col_letter(n):
 
 def upsert_rows(ws, key_cols_count, rows):
     """Atualiza linhas cuja chave (primeiras `key_cols_count` colunas) já existe;
-    cria linha nova quando a chave ainda não apareceu hoje."""
+    cria linha nova quando a chave ainda não apareceu hoje.
+
+    Duas otimizações pra não estourar a cota de escrita do Google Sheets:
+    1) Se o conteúdo da linha já é idêntico ao que está na planilha, não
+       escreve nada (a maioria dos eventos antigos do log não muda mais).
+    2) As atualizações que sobrarem vão todas num único batch_update,
+       em vez de uma chamada de API por linha."""
     if not rows:
         return
 
@@ -633,22 +639,32 @@ def upsert_rows(ws, key_cols_count, rows):
     corpo = existentes[1:] if len(existentes) > 1 else []
 
     chave_para_linha = {}
+    chave_para_valores = {}
     for i, linha_existente in enumerate(corpo):
         chave = tuple(linha_existente[:key_cols_count])
         chave_para_linha[chave] = i + 2
+        chave_para_valores[chave] = linha_existente
 
     atualizacoes = []
     novas = []
     for row in rows:
         chave = tuple(str(v) for v in row[:key_cols_count])
+        row_str = [str(v) for v in row]
         if chave in chave_para_linha:
-            atualizacoes.append((chave_para_linha[chave], row))
+            existente = chave_para_valores.get(chave, [])
+            existente_completo = existente + [""] * (len(row_str) - len(existente))
+            if existente_completo[:len(row_str)] != row_str:
+                atualizacoes.append((chave_para_linha[chave], row))
+            # conteúdo igual ao que já está na planilha -> pula, economiza cota
         else:
             novas.append(row)
 
-    for numero_linha, valores in atualizacoes:
-        rng = f"A{numero_linha}:{col_letter(len(valores))}{numero_linha}"
-        ws.update(range_name=rng, values=[valores], value_input_option="USER_ENTERED")
+    if atualizacoes:
+        lote = [
+            {"range": f"A{numero_linha}:{col_letter(len(valores))}{numero_linha}", "values": [valores]}
+            for numero_linha, valores in atualizacoes
+        ]
+        ws.batch_update(lote, value_input_option="USER_ENTERED")
 
     if novas:
         ws.append_rows(novas, value_input_option="USER_ENTERED")
