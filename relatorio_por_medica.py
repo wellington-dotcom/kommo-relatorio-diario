@@ -21,8 +21,30 @@ Reaproveita os secrets que já existem: GOOGLE_CREDENTIALS e SHEET_ID.
 
 import os
 import json
+import time
 from collections import defaultdict
 import gspread
+
+
+def com_retry(func, *args, tentativas=4, espera_inicial=5, **kwargs):
+    """Roda func(*args, **kwargs) tentando de novo se der erro transitório
+    da API do Google (ex: 503 Service Unavailable). Espera aumenta a cada
+    tentativa (5s, 10s, 20s...)."""
+    espera = espera_inicial
+    for tentativa in range(1, tentativas + 1):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            transitorio = status in (429, 500, 502, 503, 504)
+            if not transitorio or tentativa == tentativas:
+                raise
+            print(
+                f"Aviso: erro transitório da API do Google (tentativa "
+                f"{tentativa}/{tentativas}): {e}. Tentando de novo em {espera}s..."
+            )
+            time.sleep(espera)
+            espera *= 2
 
 GOOGLE_CREDENTIALS = json.loads(os.environ["GOOGLE_CREDENTIALS"])
 SHEET_ID = os.environ["SHEET_ID"]
@@ -63,7 +85,7 @@ HEADER = [
 
 def conectar_planilha():
     gc = gspread.service_account_from_dict(GOOGLE_CREDENTIALS)
-    return gc.open_by_key(SHEET_ID)
+    return com_retry(gc.open_by_key, SHEET_ID)
 
 
 def identificar_medica(texto):
@@ -76,7 +98,7 @@ def identificar_medica(texto):
 
 def agregar_gasto_por_medica_dia(sh):
     ws = sh.worksheet(ABA_META_ADS)
-    registros = ws.get_all_records()
+    registros = com_retry(ws.get_all_records)
 
     por_chave = defaultdict(float)  # (data, medica) -> gasto acumulado
     nao_identificados = set()
@@ -122,7 +144,7 @@ def garantir_aba_saida(sh):
 
 def ler_linhas_existentes(ws):
     """Retorna {(data, medica): numero_da_linha} e a lista completa de linhas."""
-    valores = ws.get_all_values()
+    valores = com_retry(ws.get_all_values)
     existentes = {}
     for i, linha in enumerate(valores[1:], start=2):  # pula cabeçalho
         if len(linha) >= 2 and linha[0] and linha[1]:
@@ -188,10 +210,10 @@ def main():
         processar_linha(data, LABEL_TOTAL_DIA, gasto_total_por_dia[data], eh_total=True)
 
     if atualizacoes:
-        ws.batch_update(atualizacoes, value_input_option="USER_ENTERED")
+        com_retry(ws.batch_update, atualizacoes, value_input_option="USER_ENTERED")
 
     if novas_linhas:
-        ws.append_rows(novas_linhas, value_input_option="USER_ENTERED")
+        com_retry(ws.append_rows, novas_linhas, value_input_option="USER_ENTERED")
 
     print(
         f"{len(atualizacoes)} linha(s) atualizadas, "
