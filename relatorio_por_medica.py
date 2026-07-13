@@ -2,31 +2,30 @@
 relatorio_por_medica.py
 
 Cria/atualiza uma aba "Gasto e Leads por Médica" cruzando:
-  - Gasto diário por médica, identificado automaticamente pelo nome que
-    já aparece no nome da campanha/anúncio na aba "Meta Ads Report"
-    (ex: "[ISABELLA]", "[DR_BRUNA]", "[LAESSA]")
-  - Leads entregues no dia segundo o próprio Meta (métrica de conversas
-    iniciadas), também por médica - automático, mesma fonte do gasto
-  - Uma coluna "Leads" que fica em aberto pra preenchimento manual (hoje
-    essa contagem real por médica vem do Marcelo por WhatsApp)
-  - Uma coluna "Custo por Lead" calculada automaticamente (fórmula viva
-    na planilha), usando o Lead REAL (manual/Kommo), não o do Meta
+  - Gasto diário por médica (automático, da aba "Meta Ads Report",
+    identificado pelo nome que já aparece no nome da campanha/anúncio,
+    ex: "[ISABELLA]", "[DR_BRUNA]", "[LAESSA]")
+  - Leads Entregues segundo o próprio Meta, também por médica
+    (automático, mesma fonte do gasto)
+  - Uma linha de TOTAL DO DIA que soma o gasto/leads-do-Meta de todas as
+    médicas E traz o total REAL de leads que chegou no Kommo naquele dia
+    (automático, via fórmula que busca na aba "Leads Novos por Dia")
+
+IMPORTANTE: o Kommo não separa lead por médica - essa informação não
+existe automatizada em lugar nenhum. Por isso o total real de leads só
+aparece no nível do DIA (linha de TOTAL), nunca por médica individual.
 
 Colunas da aba de saída:
   A: Data
-  B: Médica
+  B: Médica  (ou "TOTAL DO DIA (Kommo)" na linha de resumo)
   C: Gasto Total (Meta)
-  D: Leads Entregues (Meta)          <- automático
-  E: Leads (preencher manualmente)   <- manual (ou fórmula, na linha de total)
-  F: Custo por Lead                  <- fórmula, sempre = C / E
+  D: Leads Entregues (Meta)
+  E: Leads Reais (Kommo)   <- só preenchido na linha de TOTAL DO DIA
+  F: Custo por Lead        <- só calculado na linha de TOTAL DO DIA
 
-IMPORTANTE: este script NUNCA apaga a aba inteira. Ele só:
-  - adiciona linhas novas pra combinações (data, médica) que ainda não
-    existem
-  - atualiza gasto/leads-do-Meta/fórmula de custo em linhas já existentes
-  - nunca escreve nem apaga nada na coluna "Leads" (E) preenchida
-    manualmente, exceto na linha especial de TOTAL DO DIA, onde essa
-    coluna é uma fórmula automática que busca o total real no Kommo
+IMPORTANTE: este script NUNCA apaga a aba inteira. Ele só adiciona linhas
+novas pra combinações (data, médica) que ainda não existem, e atualiza
+gasto/leads/fórmulas de linhas que já existem.
 
 Reaproveita os secrets que já existem: GOOGLE_CREDENTIALS e SHEET_ID.
 """
@@ -71,7 +70,7 @@ COL_SPEND = "spend"
 COL_CAMPANHA = "campaign_name"
 COL_ANUNCIO = "ad_name"
 # Métrica que a própria Meta usa como proxy de "leads"/conversas
-# iniciadas por mensagem. É a mesma coluna usada no relatório de insights.
+# iniciadas por mensagem.
 COL_LEADS_META = "actions__onsite_conversion.messaging_conversation_started_7d"
 
 # AJUSTAR conforme as colunas reais da aba "Leads Novos por Dia":
@@ -79,7 +78,8 @@ COL_LEADS_META = "actions__onsite_conversion.messaging_conversation_started_7d"
 COLUNA_DATA_KOMMO = "A"
 COLUNA_LEADS_KOMMO = "B"
 
-LABEL_TOTAL_DIA = "TOTAL DO DIA (Kommo)"
+LABEL_TOTAL_DIA = "TOTAL DO DIA"
+LABEL_TOTAL_DIA_ANTIGO = "TOTAL DO DIA (Kommo)"  # usado em versões anteriores do script
 
 # Palavras-chave que identificam cada médica dentro do nome da
 # campanha/anúncio (não diferencia maiúsculas/minúsculas). Ajuste ou
@@ -95,7 +95,7 @@ HEADER = [
     "Médica",
     "Gasto Total (Meta)",
     "Leads Entregues (Meta)",
-    "Leads (preencher manualmente)",
+    "Leads Reais (Kommo)",
     "Custo por Lead",
 ]
 
@@ -168,6 +168,19 @@ def garantir_aba_saida(sh):
     return ws
 
 
+def migrar_rotulo_antigo(ws):
+    """Renomeia linhas que ainda usam o rótulo antigo 'TOTAL DO DIA (Kommo)'
+    para o novo 'TOTAL DO DIA', pra não duplicar linha de total."""
+    valores = com_retry(ws.get_all_values)
+    atualizacoes = []
+    for i, linha in enumerate(valores[1:], start=2):  # pula cabeçalho
+        if len(linha) >= 2 and linha[1] == LABEL_TOTAL_DIA_ANTIGO:
+            atualizacoes.append({"range": f"B{i}", "values": [[LABEL_TOTAL_DIA]]})
+    if atualizacoes:
+        com_retry(ws.batch_update, atualizacoes, value_input_option="USER_ENTERED")
+        print(f"Migrado {len(atualizacoes)} linha(s) do rótulo antigo pro novo.")
+
+
 def ler_linhas_existentes(ws):
     """Retorna {(data, medica): numero_da_linha} e a lista completa de linhas."""
     valores = com_retry(ws.get_all_values)
@@ -184,6 +197,7 @@ def main():
 
     gasto_por_chave, leads_meta_por_chave, nao_identificados = agregar_por_medica_dia(sh)
     verificar_aba_leads_kommo(sh)
+    migrar_rotulo_antigo(ws)
     existentes, valores = ler_linhas_existentes(ws)
 
     gasto_total_por_dia = defaultdict(float)
@@ -204,13 +218,14 @@ def main():
         return f'=IFERROR(VLOOKUP(A{linha_num};{intervalo};{col_offset};FALSE);"")'
 
     def formula_custo(linha_num):
-        # Custo real usa a coluna E (lead de verdade), não a D (estimativa do Meta)
         return f'=IF(E{linha_num}="";"";C{linha_num}/E{linha_num})'
 
     def processar_linha(data, medica, gasto, leads_meta, eh_total=False):
-        """eh_total=True -> linha de TOTAL, também escreve a fórmula de
-        leads do Kommo na coluna E. eh_total=False -> linha por médica,
-        nunca mexe na coluna E (manual), mas sempre atualiza C, D e F."""
+        """eh_total=True -> linha de TOTAL, escreve gasto/leads-meta somados
+        + fórmula de leads reais do Kommo (E) + fórmula de custo (F).
+        eh_total=False -> linha por médica, escreve só gasto (C) e leads do
+        Meta (D); as colunas E e F ficam sempre em branco (não existe
+        divisão real por médica no Kommo)."""
         nonlocal proxima_linha
         gasto_fmt = round(gasto, 2)
         leads_meta_fmt = round(leads_meta, 2)
@@ -233,13 +248,15 @@ def main():
                     "range": f"C{linha_num}:D{linha_num}",
                     "values": [[gasto_fmt, leads_meta_fmt]],
                 })
-                atualizacoes.append({"range": f"F{linha_num}", "values": [[formula_custo(linha_num)]]})
         else:
             linha_num = proxima_linha + len(novas_linhas)
-            leads_real_valor = formula_leads_kommo(linha_num) if eh_total else ""
-            novas_linhas.append([
-                data, medica, gasto_fmt, leads_meta_fmt, leads_real_valor, formula_custo(linha_num)
-            ])
+            if eh_total:
+                novas_linhas.append([
+                    data, medica, gasto_fmt, leads_meta_fmt,
+                    formula_leads_kommo(linha_num), formula_custo(linha_num),
+                ])
+            else:
+                novas_linhas.append([data, medica, gasto_fmt, leads_meta_fmt, "", ""])
 
     # Ordem fixa das médicas (mesma ordem do dicionário MEDICAS), pra sair
     # sempre no mesmo padrão visual, dia a dia.
