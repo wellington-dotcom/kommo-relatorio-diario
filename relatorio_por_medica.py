@@ -5,16 +5,28 @@ Cria/atualiza uma aba "Gasto e Leads por Médica" cruzando:
   - Gasto diário por médica, identificado automaticamente pelo nome que
     já aparece no nome da campanha/anúncio na aba "Meta Ads Report"
     (ex: "[ISABELLA]", "[DR_BRUNA]", "[LAESSA]")
+  - Leads entregues no dia segundo o próprio Meta (métrica de conversas
+    iniciadas), também por médica - automático, mesma fonte do gasto
   - Uma coluna "Leads" que fica em aberto pra preenchimento manual (hoje
-    essa contagem por médica vem do Marcelo por WhatsApp)
+    essa contagem real por médica vem do Marcelo por WhatsApp)
   - Uma coluna "Custo por Lead" calculada automaticamente (fórmula viva
-    na planilha) assim que Leads for preenchido
+    na planilha), usando o Lead REAL (manual/Kommo), não o do Meta
+
+Colunas da aba de saída:
+  A: Data
+  B: Médica
+  C: Gasto Total (Meta)
+  D: Leads Entregues (Meta)          <- automático
+  E: Leads (preencher manualmente)   <- manual (ou fórmula, na linha de total)
+  F: Custo por Lead                  <- fórmula, sempre = C / E
 
 IMPORTANTE: este script NUNCA apaga a aba inteira. Ele só:
   - adiciona linhas novas pra combinações (data, médica) que ainda não
     existem
-  - atualiza o valor de gasto de linhas que já existem
-  - nunca escreve nem apaga nada na coluna "Leads" preenchida manualmente
+  - atualiza gasto/leads-do-Meta/fórmula de custo em linhas já existentes
+  - nunca escreve nem apaga nada na coluna "Leads" (E) preenchida
+    manualmente, exceto na linha especial de TOTAL DO DIA, onde essa
+    coluna é uma fórmula automática que busca o total real no Kommo
 
 Reaproveita os secrets que já existem: GOOGLE_CREDENTIALS e SHEET_ID.
 """
@@ -46,6 +58,7 @@ def com_retry(func, *args, tentativas=4, espera_inicial=5, **kwargs):
             time.sleep(espera)
             espera *= 2
 
+
 GOOGLE_CREDENTIALS = json.loads(os.environ["GOOGLE_CREDENTIALS"])
 SHEET_ID = os.environ["SHEET_ID"]
 
@@ -57,6 +70,9 @@ COL_DATA_META = "date_start"
 COL_SPEND = "spend"
 COL_CAMPANHA = "campaign_name"
 COL_ANUNCIO = "ad_name"
+# Métrica que a própria Meta usa como proxy de "leads"/conversas
+# iniciadas por mensagem. É a mesma coluna usada no relatório de insights.
+COL_LEADS_META = "actions__onsite_conversion.messaging_conversation_started_7d"
 
 # AJUSTAR conforme as colunas reais da aba "Leads Novos por Dia":
 # qual letra de coluna tem a Data, e qual tem a quantidade de leads.
@@ -78,6 +94,7 @@ HEADER = [
     "Data",
     "Médica",
     "Gasto Total (Meta)",
+    "Leads Entregues (Meta)",
     "Leads (preencher manualmente)",
     "Custo por Lead",
 ]
@@ -96,11 +113,21 @@ def identificar_medica(texto):
     return None
 
 
-def agregar_gasto_por_medica_dia(sh):
+def para_float(valor):
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def agregar_por_medica_dia(sh):
+    """Retorna dois dicts (data, medica) -> valor: um de gasto, outro de
+    leads entregues segundo o Meta. Ambos vêm da mesma aba/linha."""
     ws = sh.worksheet(ABA_META_ADS)
     registros = com_retry(ws.get_all_records)
 
-    por_chave = defaultdict(float)  # (data, medica) -> gasto acumulado
+    gasto_por_chave = defaultdict(float)
+    leads_meta_por_chave = defaultdict(float)
     nao_identificados = set()
 
     for row in registros:
@@ -112,13 +139,12 @@ def agregar_gasto_por_medica_dia(sh):
         if not medica:
             nao_identificados.add(texto_busca[:60])
             continue
-        try:
-            spend = float(row.get(COL_SPEND) or 0)
-        except (TypeError, ValueError):
-            spend = 0.0
-        por_chave[(data, medica)] += spend
 
-    return por_chave, nao_identificados
+        chave = (data, medica)
+        gasto_por_chave[chave] += para_float(row.get(COL_SPEND))
+        leads_meta_por_chave[chave] += para_float(row.get(COL_LEADS_META))
+
+    return gasto_por_chave, leads_meta_por_chave, nao_identificados
 
 
 def verificar_aba_leads_kommo(sh):
@@ -156,14 +182,16 @@ def main():
     sh = conectar_planilha()
     ws = garantir_aba_saida(sh)
 
-    gasto_por_chave, nao_identificados = agregar_gasto_por_medica_dia(sh)
+    gasto_por_chave, leads_meta_por_chave, nao_identificados = agregar_por_medica_dia(sh)
     verificar_aba_leads_kommo(sh)
     existentes, valores = ler_linhas_existentes(ws)
 
     gasto_total_por_dia = defaultdict(float)
+    leads_meta_total_por_dia = defaultdict(float)
     medicas_por_data = defaultdict(set)
     for (data, medica), gasto in gasto_por_chave.items():
         gasto_total_por_dia[data] += gasto
+        leads_meta_total_por_dia[data] += leads_meta_por_chave[(data, medica)]
         medicas_por_data[data].add(medica)
 
     atualizacoes = []
@@ -171,33 +199,47 @@ def main():
     proxima_linha = len(valores) + 1
 
     def formula_leads_kommo(linha_num):
-        intervalo = (
-            f"'{ABA_LEADS_KOMMO}'!{COLUNA_DATA_KOMMO}:{COLUNA_LEADS_KOMMO}"
-        )
+        intervalo = f"'{ABA_LEADS_KOMMO}'!{COLUNA_DATA_KOMMO}:{COLUNA_LEADS_KOMMO}"
         col_offset = ord(COLUNA_LEADS_KOMMO) - ord(COLUNA_DATA_KOMMO) + 1
-        return f'=IFERROR(VLOOKUP(A{linha_num},{intervalo},{col_offset},FALSE),"")'
+        return f'=IFERROR(VLOOKUP(A{linha_num};{intervalo};{col_offset};FALSE);"")'
 
-    def processar_linha(data, medica, gasto, eh_total=False):
+    def formula_custo(linha_num):
+        # Custo real usa a coluna E (lead de verdade), não a D (estimativa do Meta)
+        return f'=IF(E{linha_num}="";"";C{linha_num}/E{linha_num})'
+
+    def processar_linha(data, medica, gasto, leads_meta, eh_total=False):
         """eh_total=True -> linha de TOTAL, também escreve a fórmula de
-        leads. eh_total=False -> linha por médica, nunca mexe em Leads."""
+        leads do Kommo na coluna E. eh_total=False -> linha por médica,
+        nunca mexe na coluna E (manual), mas sempre atualiza C, D e F."""
         nonlocal proxima_linha
         gasto_fmt = round(gasto, 2)
+        leads_meta_fmt = round(leads_meta, 2)
         chave = (data, medica)
 
         if chave in existentes:
             linha_num = existentes[chave]
             if eh_total:
-                faixa = f"C{linha_num}:D{linha_num}"
-                valores_att = [gasto_fmt, formula_leads_kommo(linha_num)]
+                atualizacoes.append({
+                    "range": f"C{linha_num}:F{linha_num}",
+                    "values": [[
+                        gasto_fmt,
+                        leads_meta_fmt,
+                        formula_leads_kommo(linha_num),
+                        formula_custo(linha_num),
+                    ]],
+                })
             else:
-                faixa = f"C{linha_num}"
-                valores_att = [gasto_fmt]
-            atualizacoes.append({"range": faixa, "values": [valores_att]})
+                atualizacoes.append({
+                    "range": f"C{linha_num}:D{linha_num}",
+                    "values": [[gasto_fmt, leads_meta_fmt]],
+                })
+                atualizacoes.append({"range": f"F{linha_num}", "values": [[formula_custo(linha_num)]]})
         else:
             linha_num = proxima_linha + len(novas_linhas)
-            formula_custo = f'=IF(D{linha_num}="","",C{linha_num}/D{linha_num})'
-            leads_valor = formula_leads_kommo(linha_num) if eh_total else ""
-            novas_linhas.append([data, medica, gasto_fmt, leads_valor, formula_custo])
+            leads_real_valor = formula_leads_kommo(linha_num) if eh_total else ""
+            novas_linhas.append([
+                data, medica, gasto_fmt, leads_meta_fmt, leads_real_valor, formula_custo(linha_num)
+            ])
 
     # Ordem fixa das médicas (mesma ordem do dicionário MEDICAS), pra sair
     # sempre no mesmo padrão visual, dia a dia.
@@ -206,8 +248,11 @@ def main():
     for data in sorted(gasto_total_por_dia.keys()):
         for medica in ordem_medicas:
             if medica in medicas_por_data[data]:
-                processar_linha(data, medica, gasto_por_chave[(data, medica)])
-        processar_linha(data, LABEL_TOTAL_DIA, gasto_total_por_dia[data], eh_total=True)
+                chave = (data, medica)
+                processar_linha(data, medica, gasto_por_chave[chave], leads_meta_por_chave[chave])
+        processar_linha(
+            data, LABEL_TOTAL_DIA, gasto_total_por_dia[data], leads_meta_total_por_dia[data], eh_total=True
+        )
 
     if atualizacoes:
         com_retry(ws.batch_update, atualizacoes, value_input_option="USER_ENTERED")
