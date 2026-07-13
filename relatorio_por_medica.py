@@ -1,31 +1,33 @@
 """
 relatorio_por_medica.py
 
-Cria/atualiza uma aba "Gasto e Leads por Médica" cruzando:
-  - Gasto diário por médica (automático, da aba "Meta Ads Report",
-    identificado pelo nome que já aparece no nome da campanha/anúncio,
-    ex: "[ISABELLA]", "[DR_BRUNA]", "[LAESSA]")
-  - Leads Entregues segundo o próprio Meta, também por médica
-    (automático, mesma fonte do gasto)
-  - Uma linha de TOTAL DO DIA que soma o gasto/leads-do-Meta de todas as
-    médicas E traz o total REAL de leads que chegou no Kommo naquele dia
-    (automático, via fórmula que busca na aba "Leads Novos por Dia")
+Cria/mantém uma aba "Gasto e Leads por Médica" com a estrutura de linhas
+(uma por médica/dia + uma linha de TOTAL DO DIA), mas os VALORES em si
+são fórmulas vivas da própria planilha, não números calculados pelo
+script. Ou seja: o script só garante que a linha existe; quem calcula o
+valor é o próprio Google Sheets, puxando das outras abas.
 
-IMPORTANTE: o Kommo não separa lead por médica - essa informação não
-existe automatizada em lugar nenhum. Por isso o total real de leads só
-aparece no nível do DIA (linha de TOTAL), nunca por médica individual.
+Fórmulas usadas:
+  - Gasto Total (Meta) e Leads Entregues (Meta): SUMPRODUCT que soma a
+    aba "Meta Ads Report" filtrando por data e, nas linhas de médica,
+    também pelo nome dela aparecer no nome da campanha/anúncio. As
+    colunas de origem são localizadas pelo NOME do cabeçalho (MATCH),
+    não por letra fixa - evita erro de contar posição de coluna errado.
+  - Leads Reais (Kommo): VLOOKUP na aba "Leads Novos por Dia".
+  - Custo por Lead: gasto do dia dividido pelos leads reais do dia.
 
 Colunas da aba de saída:
   A: Data
-  B: Médica  (ou "TOTAL DO DIA (Kommo)" na linha de resumo)
-  C: Gasto Total (Meta)
-  D: Leads Entregues (Meta)
-  E: Leads Reais (Kommo)   <- só preenchido na linha de TOTAL DO DIA
-  F: Custo por Lead        <- só calculado na linha de TOTAL DO DIA
+  B: Médica  (ou "TOTAL DO DIA" na linha de resumo)
+  C: Gasto Total (Meta)        <- fórmula
+  D: Leads Entregues (Meta)    <- fórmula
+  E: Leads Reais (Kommo)       <- fórmula, só na linha de TOTAL DO DIA
+  F: Custo por Lead            <- fórmula, só na linha de TOTAL DO DIA
 
 IMPORTANTE: este script NUNCA apaga a aba inteira. Ele só adiciona linhas
-novas pra combinações (data, médica) que ainda não existem, e atualiza
-gasto/leads/fórmulas de linhas que já existem.
+novas pra combinações (data, médica) que ainda não existem, e garante que
+as fórmulas de C, D (e E, F na linha de total) estejam corretas em todas
+as linhas - inclusive corrigindo linhas antigas se necessário.
 
 Reaproveita os secrets que já existem: GOOGLE_CREDENTIALS e SHEET_ID.
 """
@@ -39,8 +41,7 @@ import gspread
 
 def com_retry(func, *args, tentativas=4, espera_inicial=5, **kwargs):
     """Roda func(*args, **kwargs) tentando de novo se der erro transitório
-    da API do Google (ex: 503 Service Unavailable). Espera aumenta a cada
-    tentativa (5s, 10s, 20s...)."""
+    da API do Google (ex: 503 Service Unavailable)."""
     espera = espera_inicial
     for tentativa in range(1, tentativas + 1):
         try:
@@ -65,25 +66,28 @@ ABA_META_ADS = "Meta Ads Report"
 ABA_LEADS_KOMMO = "Leads Novos por Dia"
 ABA_SAIDA = "Gasto e Leads por Médica"
 
+# Nomes EXATOS dos cabeçalhos na aba "Meta Ads Report" (a fórmula acha a
+# coluna procurando por esse texto na linha 1, não por letra fixa).
 COL_DATA_META = "date_start"
 COL_SPEND = "spend"
 COL_CAMPANHA = "campaign_name"
 COL_ANUNCIO = "ad_name"
-# Métrica que a própria Meta usa como proxy de "leads"/conversas
-# iniciadas por mensagem.
 COL_LEADS_META = "actions__onsite_conversion.messaging_conversation_started_7d"
 
+# Faixa de colunas na aba Meta Ads Report a considerar na busca por nome
+# de cabeçalho (ZZ cobre até ~700 colunas, bem mais que o necessário).
+FAIXA_META_ADS = f"'{ABA_META_ADS}'!$A:$ZZ"
+CABECALHO_META_ADS = f"'{ABA_META_ADS}'!$1:$1"
+
 # AJUSTAR conforme as colunas reais da aba "Leads Novos por Dia":
-# qual letra de coluna tem a Data, e qual tem a quantidade de leads.
 COLUNA_DATA_KOMMO = "A"
 COLUNA_LEADS_KOMMO = "B"
 
 LABEL_TOTAL_DIA = "TOTAL DO DIA"
-LABEL_TOTAL_DIA_ANTIGO = "TOTAL DO DIA (Kommo)"  # usado em versões anteriores do script
+LABEL_TOTAL_DIA_ANTIGO = "TOTAL DO DIA (Kommo)"  # rótulo usado em versão anterior
 
 # Palavras-chave que identificam cada médica dentro do nome da
-# campanha/anúncio (não diferencia maiúsculas/minúsculas). Ajuste ou
-# adicione médicas aqui conforme necessário.
+# campanha/anúncio (não diferencia maiúsculas/minúsculas).
 MEDICAS = {
     "Dra. Isabella Eleutério": ["ISABELLA"],
     "Dra. Bruna": ["BRUNA"],
@@ -105,6 +109,39 @@ def conectar_planilha():
     return com_retry(gc.open_by_key, SHEET_ID)
 
 
+def col_por_nome(nome_cabecalho):
+    """Fórmula parcial que localiza uma coluna inteira da aba Meta Ads
+    Report pelo nome do cabeçalho, em vez de uma letra fixa."""
+    return f'INDEX({FAIXA_META_ADS},0,MATCH("{nome_cabecalho}",{CABECALHO_META_ADS},0))'
+
+
+def formula_meta_sumproduct(linha_num, coluna_valor, palavras_chave=None):
+    """Soma uma coluna da aba Meta Ads Report filtrando por data (sempre)
+    e, se palavras_chave for passado, também pelo nome da médica aparecer
+    no nome da campanha/anúncio (usado nas linhas por médica). Sem
+    palavras_chave, soma o dia inteiro (usado na linha de TOTAL DO DIA)."""
+    filtro_data = f"({col_por_nome(COL_DATA_META)}=$A{linha_num})"
+    valor = f"N({col_por_nome(coluna_valor)})"
+
+    if palavras_chave:
+        texto_busca = f"{col_por_nome(COL_CAMPANHA)}&\" \"&{col_por_nome(COL_ANUNCIO)}"
+        partes = [f'ISNUMBER(SEARCH("{p}",{texto_busca}))' for p in palavras_chave]
+        filtro_medica = "(" + "+".join(partes) + ">0)"
+        return f"=SUMPRODUCT({filtro_data}*{filtro_medica}*{valor})"
+
+    return f"=SUMPRODUCT({filtro_data}*{valor})"
+
+
+def formula_leads_kommo(linha_num):
+    intervalo = f"'{ABA_LEADS_KOMMO}'!{COLUNA_DATA_KOMMO}:{COLUNA_LEADS_KOMMO}"
+    col_offset = ord(COLUNA_LEADS_KOMMO) - ord(COLUNA_DATA_KOMMO) + 1
+    return f'=IFERROR(VLOOKUP(A{linha_num};{intervalo};{col_offset};FALSE);"")'
+
+
+def formula_custo(linha_num):
+    return f'=IF(E{linha_num}="";"";C{linha_num}/E{linha_num})'
+
+
 def identificar_medica(texto):
     texto_up = (texto or "").upper()
     for medica, palavras in MEDICAS.items():
@@ -113,21 +150,13 @@ def identificar_medica(texto):
     return None
 
 
-def para_float(valor):
-    try:
-        return float(valor)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def agregar_por_medica_dia(sh):
-    """Retorna dois dicts (data, medica) -> valor: um de gasto, outro de
-    leads entregues segundo o Meta. Ambos vêm da mesma aba/linha."""
+def mapear_datas_e_medicas(sh):
+    """Só descobre QUAIS combinações (data, médica) existem - não soma
+    valor nenhum, já que os valores agora são fórmulas na planilha."""
     ws = sh.worksheet(ABA_META_ADS)
     registros = com_retry(ws.get_all_records)
 
-    gasto_por_chave = defaultdict(float)
-    leads_meta_por_chave = defaultdict(float)
+    medicas_por_data = defaultdict(set)
     nao_identificados = set()
 
     for row in registros:
@@ -136,26 +165,19 @@ def agregar_por_medica_dia(sh):
             continue
         texto_busca = f"{row.get(COL_CAMPANHA, '')} {row.get(COL_ANUNCIO, '')}"
         medica = identificar_medica(texto_busca)
-        if not medica:
+        if medica:
+            medicas_por_data[data].add(medica)
+        else:
             nao_identificados.add(texto_busca[:60])
-            continue
 
-        chave = (data, medica)
-        gasto_por_chave[chave] += para_float(row.get(COL_SPEND))
-        leads_meta_por_chave[chave] += para_float(row.get(COL_LEADS_META))
-
-    return gasto_por_chave, leads_meta_por_chave, nao_identificados
+    return medicas_por_data, nao_identificados
 
 
 def verificar_aba_leads_kommo(sh):
-    """Só confirma que a aba existe, pra avisar se o nome estiver errado.
-    O valor em si passa a ser buscado por fórmula direto na planilha."""
     try:
         sh.worksheet(ABA_LEADS_KOMMO)
-        return True
     except gspread.exceptions.WorksheetNotFound:
-        print(f"Aviso: aba '{ABA_LEADS_KOMMO}' não encontrada - a fórmula de total do dia vai ficar em branco.")
-        return False
+        print(f"Aviso: aba '{ABA_LEADS_KOMMO}' não encontrada - a fórmula de leads reais vai ficar em branco.")
 
 
 def garantir_aba_saida(sh):
@@ -169,11 +191,9 @@ def garantir_aba_saida(sh):
 
 
 def migrar_rotulo_antigo(ws):
-    """Renomeia linhas que ainda usam o rótulo antigo 'TOTAL DO DIA (Kommo)'
-    para o novo 'TOTAL DO DIA', pra não duplicar linha de total."""
     valores = com_retry(ws.get_all_values)
     atualizacoes = []
-    for i, linha in enumerate(valores[1:], start=2):  # pula cabeçalho
+    for i, linha in enumerate(valores[1:], start=2):
         if len(linha) >= 2 and linha[1] == LABEL_TOTAL_DIA_ANTIGO:
             atualizacoes.append({"range": f"B{i}", "values": [[LABEL_TOTAL_DIA]]})
     if atualizacoes:
@@ -182,10 +202,9 @@ def migrar_rotulo_antigo(ws):
 
 
 def ler_linhas_existentes(ws):
-    """Retorna {(data, medica): numero_da_linha} e a lista completa de linhas."""
     valores = com_retry(ws.get_all_values)
     existentes = {}
-    for i, linha in enumerate(valores[1:], start=2):  # pula cabeçalho
+    for i, linha in enumerate(valores[1:], start=2):
         if len(linha) >= 2 and linha[0] and linha[1]:
             existentes[(linha[0], linha[1])] = i
     return existentes, valores
@@ -195,81 +214,56 @@ def main():
     sh = conectar_planilha()
     ws = garantir_aba_saida(sh)
 
-    gasto_por_chave, leads_meta_por_chave, nao_identificados = agregar_por_medica_dia(sh)
+    medicas_por_data, nao_identificados = mapear_datas_e_medicas(sh)
     verificar_aba_leads_kommo(sh)
     migrar_rotulo_antigo(ws)
     existentes, valores = ler_linhas_existentes(ws)
-
-    gasto_total_por_dia = defaultdict(float)
-    leads_meta_total_por_dia = defaultdict(float)
-    medicas_por_data = defaultdict(set)
-    for (data, medica), gasto in gasto_por_chave.items():
-        gasto_total_por_dia[data] += gasto
-        leads_meta_total_por_dia[data] += leads_meta_por_chave[(data, medica)]
-        medicas_por_data[data].add(medica)
 
     atualizacoes = []
     novas_linhas = []
     proxima_linha = len(valores) + 1
 
-    def formula_leads_kommo(linha_num):
-        intervalo = f"'{ABA_LEADS_KOMMO}'!{COLUNA_DATA_KOMMO}:{COLUNA_LEADS_KOMMO}"
-        col_offset = ord(COLUNA_LEADS_KOMMO) - ord(COLUNA_DATA_KOMMO) + 1
-        return f'=IFERROR(VLOOKUP(A{linha_num};{intervalo};{col_offset};FALSE);"")'
-
-    def formula_custo(linha_num):
-        return f'=IF(E{linha_num}="";"";C{linha_num}/E{linha_num})'
-
-    def processar_linha(data, medica, gasto, leads_meta, eh_total=False):
-        """eh_total=True -> linha de TOTAL, escreve gasto/leads-meta somados
-        + fórmula de leads reais do Kommo (E) + fórmula de custo (F).
-        eh_total=False -> linha por médica, escreve só gasto (C) e leads do
-        Meta (D); as colunas E e F ficam sempre em branco (não existe
-        divisão real por médica no Kommo)."""
+    def processar_linha(data, medica, eh_total=False):
         nonlocal proxima_linha
-        gasto_fmt = round(gasto, 2)
-        leads_meta_fmt = round(leads_meta, 2)
         chave = (data, medica)
+        palavras = None if eh_total else MEDICAS[medica]
 
         if chave in existentes:
             linha_num = existentes[chave]
+            f_gasto = formula_meta_sumproduct(linha_num, COL_SPEND, palavras)
+            f_leads_meta = formula_meta_sumproduct(linha_num, COL_LEADS_META, palavras)
             if eh_total:
                 atualizacoes.append({
                     "range": f"C{linha_num}:F{linha_num}",
                     "values": [[
-                        gasto_fmt,
-                        leads_meta_fmt,
-                        formula_leads_kommo(linha_num),
-                        formula_custo(linha_num),
+                        f_gasto, f_leads_meta,
+                        formula_leads_kommo(linha_num), formula_custo(linha_num),
                     ]],
                 })
             else:
                 atualizacoes.append({
                     "range": f"C{linha_num}:D{linha_num}",
-                    "values": [[gasto_fmt, leads_meta_fmt]],
+                    "values": [[f_gasto, f_leads_meta]],
                 })
         else:
             linha_num = proxima_linha + len(novas_linhas)
+            f_gasto = formula_meta_sumproduct(linha_num, COL_SPEND, palavras)
+            f_leads_meta = formula_meta_sumproduct(linha_num, COL_LEADS_META, palavras)
             if eh_total:
                 novas_linhas.append([
-                    data, medica, gasto_fmt, leads_meta_fmt,
+                    data, medica, f_gasto, f_leads_meta,
                     formula_leads_kommo(linha_num), formula_custo(linha_num),
                 ])
             else:
-                novas_linhas.append([data, medica, gasto_fmt, leads_meta_fmt, "", ""])
+                novas_linhas.append([data, medica, f_gasto, f_leads_meta, "", ""])
 
-    # Ordem fixa das médicas (mesma ordem do dicionário MEDICAS), pra sair
-    # sempre no mesmo padrão visual, dia a dia.
     ordem_medicas = list(MEDICAS.keys())
 
-    for data in sorted(gasto_total_por_dia.keys()):
+    for data in sorted(medicas_por_data.keys()):
         for medica in ordem_medicas:
             if medica in medicas_por_data[data]:
-                chave = (data, medica)
-                processar_linha(data, medica, gasto_por_chave[chave], leads_meta_por_chave[chave])
-        processar_linha(
-            data, LABEL_TOTAL_DIA, gasto_total_por_dia[data], leads_meta_total_por_dia[data], eh_total=True
-        )
+                processar_linha(data, medica)
+        processar_linha(data, LABEL_TOTAL_DIA, eh_total=True)
 
     if atualizacoes:
         com_retry(ws.batch_update, atualizacoes, value_input_option="USER_ENTERED")
@@ -284,7 +278,7 @@ def main():
     if nao_identificados:
         print(
             f"\n{len(nao_identificados)} combinação(ões) de campanha/anúncio "
-            f"sem médica identificada (gasto não incluído no relatório):"
+            f"sem médica identificada:"
         )
         for texto in list(nao_identificados)[:10]:
             print(f"  - {texto}")
