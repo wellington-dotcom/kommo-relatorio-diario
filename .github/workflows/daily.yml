@@ -3,9 +3,10 @@ name: Relatorio Diario Kommo
 on:
   schedule:
     # a cada 15 min, das 10h às 22h UTC = 7h às 19h em Brasília (horário comercial).
-    # GitHub Actions não garante o minuto exato (pode atrasar em picos de carga),
-    # mas dispara nesse ritmo o dia inteiro em vez de só uma vez.
-    - cron: '*/15 10-22 * * *'
+    # Minutos deslocados (07/22/37/52 em vez de 00/15/30/45) pra evitar o
+    # horário de pico que todo cron do mundo usa nos minutos redondos —
+    # o GitHub avisa que agendamentos em pico podem atrasar ou ser descartados.
+    - cron: '7,22,37,52 10-22 * * *'
   workflow_dispatch:  # permite rodar manualmente pelo botão também
 
 jobs:
