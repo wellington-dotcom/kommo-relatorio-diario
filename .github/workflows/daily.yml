@@ -23,6 +23,7 @@ jobs:
 
       - name: Rodar relatorio
         env:
+          KOMMO_SUBDOMAIN: ${{ secrets.KOMMO_SUBDOMAIN }}
           KOMMO_TOKEN: ${{ secrets.KOMMO_TOKEN }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
