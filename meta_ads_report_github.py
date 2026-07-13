@@ -5,7 +5,7 @@ Variaveis de ambiente esperadas (vem dos Secrets do repositorio):
     GOOGLE_CREDENTIALS   - JSON da service account do Google (conteudo inteiro do arquivo)
     META_ACCESS_TOKEN    - token de acesso da Marketing API do Meta
     META_AD_ACCOUNT_IDS  - IDs das contas de anuncio separados por virgula
-                            (ex: "309252833499468,948696804446934")
+                            (ex: "111111111111111,222222222222222")
     SHEET_ID             - ID da planilha do Google Sheets (parte da URL)
     MODE                 - "daily" (padrao) ou "backfill"
     SINCE / UNTIL         - datas YYYY-MM-DD, usadas apenas quando MODE=backfill
@@ -13,7 +13,7 @@ Variaveis de ambiente esperadas (vem dos Secrets do repositorio):
 Modo de uso local (fora do GitHub Actions), exportando as variaveis antes:
     export GOOGLE_CREDENTIALS="$(cat service_account.json)"
     export META_ACCESS_TOKEN="..."
-    export META_AD_ACCOUNT_IDS="309252833499468,948696804446934"
+    export META_AD_ACCOUNT_IDS="111111111111111,222222222222222"
     export SHEET_ID="..."
     python meta_ads_report_github.py               # roda o dia anterior
     MODE=backfill SINCE=2026-07-01 UNTIL=2026-07-11 python meta_ads_report_github.py
