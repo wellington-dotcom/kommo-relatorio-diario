@@ -27,7 +27,7 @@ import requests
 
 META_ACCESS_TOKEN = os.environ["META_ACCESS_TOKEN"]
 # Aceita uma ou várias contas separadas por vírgula, com ou sem prefixo "act_"
-# Ex: "309252833499468,948696804446934"
+# Ex: "111111111111111,222222222222222"
 _raw_accounts = os.environ["META_AD_ACCOUNT_IDS"]
 AD_ACCOUNT_IDS = [
     acc if acc.strip().startswith("act_") else f"act_{acc.strip()}"
