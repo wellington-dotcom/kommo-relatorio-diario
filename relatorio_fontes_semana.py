@@ -164,21 +164,67 @@ FONTES = get_fontes()
 usuarios = get_usuarios()
 print(f"{len(FONTES)} fontes cadastradas no Kommo: {list(FONTES.values())}")
 
+# ============================================================
+# ISOLA só as 7 etapas do funil "01: Entrada + Agendamento" — o resto
+# do relatório (mensagens, leads novos) passa a contar só quem está
+# (ou estava, no momento da coleta) numa dessas etapas.
+# ============================================================
+PIPELINE_ID_ISOLAR = 11664299  # "01: Entrada + Agendamento"
+ETAPAS_ISOLAR = [
+    "Entrada de Lead",
+    "Aguardando Resposta HJ",
+    "Retorno Automação",
+    "Investigação",
+    "Encontrando Horário",
+    "Aguardando Dados",
+    "Dúvida Médica",
+]
+
+
+def get_status_do_pipeline(pipeline_id):
+    status_por_nome = {}
+    rr = requests.get(f"{BASE_URL}/leads/pipelines", headers=HEADERS)
+    rr.raise_for_status()
+    for p in rr.json().get("_embedded", {}).get("pipelines", []):
+        if p["id"] != pipeline_id:
+            continue
+        for s in p.get("_embedded", {}).get("statuses", []):
+            status_por_nome[s["name"]] = s["id"]
+    return status_por_nome
+
+
+status_por_nome = get_status_do_pipeline(PIPELINE_ID_ISOLAR)
+etapas_ids_isolar = {status_por_nome[n] for n in ETAPAS_ISOLAR if n in status_por_nome}
+if len(etapas_ids_isolar) < len(ETAPAS_ISOLAR):
+    faltando = [n for n in ETAPAS_ISOLAR if n not in status_por_nome]
+    print(f"AVISO: etapas não encontradas nesse funil: {faltando}")
+print(f"Isolando {len(etapas_ids_isolar)}/7 etapas do funil '01: Entrada + Agendamento'.")
+
+
+def lead_esta_nas_etapas_isoladas(lead):
+    return lead.get("pipeline_id") == PIPELINE_ID_ISOLAR and lead.get("status_id") in etapas_ids_isolar
+
+
 eventos_semana = get_eventos(ts_inicio_semana, ts_agora)
 print(f"{len(eventos_semana)} eventos coletados desde segunda-feira.")
 
-eventos_mensagem = [
+eventos_mensagem_todos = [
     e for e in eventos_semana
     if e.get("type") in ("incoming_chat_message", "outgoing_chat_message")
     and e.get("entity_type") == "lead"
 ]
 
-lead_ids_mensagens = {e["entity_id"] for e in eventos_mensagem if e.get("entity_id")}
-leads_map = get_leads_por_id(lead_ids_mensagens)
-print(f"{len(leads_map)} leads distintos trocaram mensagem essa semana.")
+lead_ids_mensagens = {e["entity_id"] for e in eventos_mensagem_todos if e.get("entity_id")}
+leads_map_todos = get_leads_por_id(lead_ids_mensagens)
 
-leads_criados_semana = get_leads_criados(ts_inicio_semana, ts_agora)
-print(f"{len(leads_criados_semana)} leads novos criados essa semana.")
+# filtra: só leads que estão nas 7 etapas isoladas
+leads_map = {lid: lead for lid, lead in leads_map_todos.items() if lead_esta_nas_etapas_isoladas(lead)}
+eventos_mensagem = [e for e in eventos_mensagem_todos if e.get("entity_id") in leads_map]
+print(f"{len(leads_map)} de {len(leads_map_todos)} leads com mensagem essa semana estão nas 7 etapas isoladas.")
+
+leads_criados_semana_todos = get_leads_criados(ts_inicio_semana, ts_agora)
+leads_criados_semana = [l for l in leads_criados_semana_todos if lead_esta_nas_etapas_isoladas(l)]
+print(f"{len(leads_criados_semana)} de {len(leads_criados_semana_todos)} leads novos essa semana estão nas 7 etapas isoladas.")
 
 
 
@@ -266,6 +312,7 @@ except gspread.exceptions.WorksheetNotFound:
 
 linhas = []
 linhas.append([f"Gerado em {agora.strftime('%d/%m/%Y %H:%M')} — dados de {inicio_semana.strftime('%d/%m/%Y')} até agora"])
+linhas.append([f"Isolado só nas 7 etapas de '01: Entrada + Agendamento': {', '.join(ETAPAS_ISOLAR)}"])
 linhas.append([])
 linhas.append(["RESUMO POR FONTE"])
 linhas.append(["Fonte", "Leads Novos (Semana)", "Leads Novos (Hoje)", "Mensagens (Semana)",
