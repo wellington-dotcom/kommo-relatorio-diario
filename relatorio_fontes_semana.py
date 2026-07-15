@@ -246,11 +246,37 @@ def nome_fonte(source_id):
     return FONTES.get(source_id, f"Fonte desconhecida ({source_id})")
 
 
+CAMPO_PROFISSIONAL_ID = 1348868
+PROFISSIONAL_FORCA_FONTE = {
+    "Bruna Vicente": "WA - Dra Brunna",
+}
+
+
+def profissional_do_lead(lead):
+    """Lê o campo personalizado 'Profissional' (id 1348868) do lead."""
+    for cf in lead.get("custom_fields_values") or []:
+        if cf.get("field_id") == CAMPO_PROFISSIONAL_ID:
+            valores = cf.get("values") or []
+            if valores:
+                return valores[0].get("value")
+    return None
+
+
+def fonte_do_lead_obj(lead):
+    """Resolve a fonte de um lead: se o campo Profissional apontar pra
+    alguém com fonte forçada (ex: Bruna Vicente -> WA - Dra Brunna), usa
+    isso — só cai no source_id normal se não houver essa correspondência."""
+    profissional = profissional_do_lead(lead)
+    if profissional in PROFISSIONAL_FORCA_FONTE:
+        return PROFISSIONAL_FORCA_FONTE[profissional]
+    return nome_fonte(lead.get("source_id"))
+
+
 def fonte_do_lead(lead_id):
     lead = leads_map.get(lead_id)
     if not lead:
         return "Lead não encontrado"
-    return nome_fonte(lead.get("source_id"))
+    return fonte_do_lead_obj(lead)
 
 
 # ============================================================
@@ -277,7 +303,7 @@ for e in eventos_mensagem:
 leads_novos_por_fonte_semana = defaultdict(int)
 leads_novos_por_fonte_hoje = defaultdict(int)
 for lead in leads_criados_semana:
-    fonte = nome_fonte(lead.get("source_id"))
+    fonte = fonte_do_lead_obj(lead)
     leads_novos_por_fonte_semana[fonte] += 1
     if lead["created_at"] >= ts_inicio_hoje:
         leads_novos_por_fonte_hoje[fonte] += 1
