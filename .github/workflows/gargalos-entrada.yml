@@ -1,0 +1,25 @@
+name: Relatorio Gargalos - Entrada e Agendamento
+
+on:
+  workflow_dispatch:  # análise pontual, só roda quando você clicar em "Run workflow"
+
+jobs:
+  rodar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar relatorio de gargalos
+        env:
+          KOMMO_SUBDOMAIN: ${{ secrets.KOMMO_SUBDOMAIN }}
+          KOMMO_TOKEN: ${{ secrets.KOMMO_TOKEN }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python relatorio_gargalos_entrada.py
