@@ -69,6 +69,18 @@ def get_fontes():
     return fontes
 
 
+def get_pipelines():
+    """Hipótese alternativa: se o WhatsApp Lite não preenche source_id,
+    talvez cada número (Clínica / Dra Bruna / Isadora) caia num FUNIL
+    diferente, e a diferenciação real esteja no pipeline_id do lead."""
+    nomes = {}
+    rr = requests.get(f"{BASE_URL}/leads/pipelines", headers=HEADERS)
+    rr.raise_for_status()
+    for p in rr.json().get("_embedded", {}).get("pipelines", []):
+        nomes[p["id"]] = p.get("name", f"Funil {p['id']}")
+    return nomes
+
+
 def get_usuarios():
     u, page = {}, 1
     while True:
@@ -114,6 +126,7 @@ def get_leads_criados(ts0, ts1):
         params = {
             "filter[created_at][from]": ts0,
             "filter[created_at][to]": ts1,
+            "with": "source_id",
             "page": page,
             "limit": 250,
         }
@@ -142,7 +155,7 @@ def get_leads_por_id(lead_ids):
     for grupo in chunk(sorted(set(lid for lid in lead_ids if lid)), 200):
         page = 1
         while True:
-            query = [("limit", 250), ("page", page)]
+            query = [("with", "source_id"), ("limit", 250), ("page", page)]
             query += [("filter[id][]", lid) for lid in grupo]
             rr = requests.get(f"{BASE_URL}/leads", headers=HEADERS, params=query)
             if rr.status_code == 204:
@@ -160,8 +173,10 @@ def get_leads_por_id(lead_ids):
 
 
 FONTES = get_fontes()
+PIPELINES = get_pipelines()
 usuarios = get_usuarios()
 print(f"{len(FONTES)} fontes cadastradas no Kommo: {list(FONTES.values())}")
+print(f"{len(PIPELINES)} funis cadastrados no Kommo: {list(PIPELINES.values())}")
 
 eventos_semana = get_eventos(ts_inicio_semana, ts_agora)
 print(f"{len(eventos_semana)} eventos coletados desde segunda-feira.")
@@ -178,6 +193,39 @@ print(f"{len(leads_map)} leads distintos trocaram mensagem essa semana.")
 
 leads_criados_semana = get_leads_criados(ts_inicio_semana, ts_agora)
 print(f"{len(leads_criados_semana)} leads novos criados essa semana.")
+
+# ============================================================
+# DIAGNÓSTICO — imprime nos logs do Actions os campos brutos de um lead e
+# de um evento de mensagem reais, pra identificar como o Kommo marca a
+# origem em conversas de WhatsApp Lite (que não preenche source_id do
+# jeito normal). Também mostra a distribuição de leads por funil, caso a
+# diferenciação real seja por pipeline_id em vez de source_id.
+# ============================================================
+print("\n=== DIAGNÓSTICO: distribuição de leads por FUNIL (pipeline) ===")
+contagem_pipeline = defaultdict(int)
+for lead in leads_criados_semana:
+    contagem_pipeline[lead.get("pipeline_id")] += 1
+for pid, qtd in sorted(contagem_pipeline.items(), key=lambda x: -x[1]):
+    print(f"  Funil '{PIPELINES.get(pid, f'ID {pid}')}' (id={pid}): {qtd} leads")
+
+if leads_map:
+    exemplo_lead = next(iter(leads_map.values()))
+    print("\n=== DIAGNÓSTICO: JSON bruto de um lead de exemplo ===")
+    print(json.dumps(exemplo_lead, indent=2, ensure_ascii=False)[:4000])
+
+if eventos_mensagem:
+    print("\n=== DIAGNÓSTICO: JSON bruto de um evento de mensagem de exemplo ===")
+    print(json.dumps(eventos_mensagem[0], indent=2, ensure_ascii=False)[:4000])
+
+# Diagnóstico: se depois desse fix ainda vier "Sem fonte identificada" pra tudo,
+# essas linhas mostram os campos crus de 3 leads reais — cole de volta no chat
+# que a gente ajusta o nome do campo certo.
+amostra_diagnostico = []
+for lead in leads_criados_semana[:3]:
+    amostra_diagnostico.append(json.dumps(
+        {k: v for k, v in lead.items() if k != "custom_fields_values"},
+        ensure_ascii=False
+    ))
 
 
 def nome_fonte(source_id):
@@ -271,6 +319,13 @@ linhas.append(["Fonte"] + FOCO)
 for fonte in todas_fontes:
     linha = [fonte] + [msgs_por_fonte_pessoa[fonte].get(p, 0) for p in FOCO]
     linhas.append(linha)
+
+linhas.append([])
+linhas.append(["DIAGNÓSTICO (ignore se as fontes acima já apareceram certas)"])
+linhas.append(["Campos crus de 3 leads reais desta semana — se 'source_id' ainda vier vazio,"])
+linhas.append(["cola essas 3 linhas de volta no chat que a gente acha o campo certo:"])
+for linha_json in amostra_diagnostico:
+    linhas.append([linha_json])
 
 ws.update(range_name="A1", values=linhas, value_input_option="USER_ENTERED")
 print(f"\nRelatório gravado na aba '{ABA_SAIDA}'.")
