@@ -56,15 +56,16 @@ FORMATO_DATA_HORA_LOG = "%d/%m/%Y %H:%M"
 
 def data_str(d):
     """Formata data como dd/mm/aaaa — usado como chave na 1a coluna de
-    todas as abas de resumo diário. Antes era str(d) que dava ISO."""
+    todas as abas de resumo diário."""
     return d.strftime(FORMATO_DATA_BR)
 
 
 def _normalizar_chave_data(valor):
     """Normaliza uma célula-chave que representa uma data pra forma canônica
-    (ISO interna). Aceita tanto '2026-08-01' quanto '01/08/2026'. Isso é
-    usado só na hora de COMPARAR chaves no upsert — permite que linhas
-    antigas gravadas em ISO ainda batam com as novas em dd/mm/aaaa,
+    (ISO interna). Aceita tanto '2026-08-01' quanto '01/08/2026', com ou
+    sem apóstrofo prefixado (legado). Isso é usado só na hora de
+    COMPARAR chaves no upsert — permite que linhas antigas gravadas em
+    ISO ou com apóstrofo ainda batam com as novas em dd/mm/aaaa limpo,
     atualizando (e migrando) a linha existente em vez de duplicar."""
     if not valor:
         return valor
@@ -492,26 +493,36 @@ def col_letter(n):
 
 
 def texto_sheets(valor):
-    """Prefixo de apóstrofo força o Google Sheets a gravar como TEXTO puro
-    (mesmo truque já usado em extrair_telefone) — evita que uma data como
-    '01/08/2026' seja reinterpretada e reformatada, o que quebrava a
-    comparação de chave a cada nova rodada. O apóstrofo não aparece no
-    valor exibido nem no que é lido de volta com get_all_values()."""
-    return f"'{valor}"
+    """Antes usávamos prefixo de apóstrofo pra forçar texto. Agora a coluna
+    A é formatada como texto puro via _travar_coluna_data_como_texto(),
+    então basta devolver o valor limpo — sem apóstrofo visível na célula."""
+    return str(valor)
 
 
 def _forcar_texto_na_data(row):
-    """Aplica texto_sheets() só na primeira coluna (sempre a data/chave)."""
-    nova = list(row)
-    if nova:
-        nova[0] = texto_sheets(nova[0])
-    return nova
+    """Mantida por compatibilidade com o resto do código. A proteção contra
+    reinterpretação da data agora vem da formatação da coluna, não do
+    prefixo — então só devolve a linha sem alterar."""
+    return list(row)
+
+
+def _travar_coluna_data_como_texto(ws):
+    """Formata a coluna A da aba como 'Texto puro' (numberFormat=TEXT). Isso
+    impede o Sheets de reinterpretar '01/08/2026' como data nativa e
+    reformatar a célula — que era o motivo original do apóstrofo. Roda
+    uma vez por aba, no início da execução; idempotente (aplicar de novo
+    não muda nada)."""
+    try:
+        ws.format("A:A", {"numberFormat": {"type": "TEXT"}})
+    except Exception as e:
+        print(f"  aviso: não consegui travar coluna A de '{ws.title}' como texto: {e}")
 
 
 def _chave_normalizada(valores, key_cols_count):
     """Constrói a tupla-chave normalizando a 1a coluna (data) — assim linhas
-    antigas gravadas em ISO ('2026-08-01') ainda batem com as novas em
-    dd/mm/aaaa ('01/08/2026'), migrando o histórico em vez de duplicar."""
+    antigas gravadas em ISO ('2026-08-01') ou com apóstrofo ainda batem
+    com as novas em dd/mm/aaaa limpo, migrando o histórico em vez de
+    duplicar."""
     partes = [str(v) for v in valores[:key_cols_count]]
     if partes:
         partes[0] = _normalizar_chave_data(partes[0])
@@ -522,16 +533,14 @@ def upsert_rows(ws, key_cols_count, rows):
     """Atualiza linhas cuja chave (primeiras `key_cols_count` colunas) já existe;
     cria linha nova quando a chave ainda não apareceu.
 
-    Três cuidados pra não estourar a cota de escrita do Google Sheets nem
-    quebrar a comparação de chave:
-    1) A primeira coluna (data) é gravada como texto puro — senão o Sheets
-       reformata a célula e a chave nunca mais bate na rodada seguinte.
+    Cuidados pra não estourar cota nem duplicar:
+    1) A coluna A é travada como texto (feito no início da execução) —
+       senão o Sheets reformata a data e a chave nunca mais bate.
     2) Se o conteúdo da linha já é idêntico ao que está na planilha, não
-       escreve nada (a maioria dos eventos antigos do log não muda mais).
-    3) As atualizações que sobrarem vão todas num único batch_update, em
-       vez de uma chamada de API por linha.
+       escreve nada.
+    3) As atualizações vão todas num único batch_update.
     4) A comparação de chave usa _chave_normalizada — datas em ISO antigas
-       batem com dd/mm/aaaa novas e são atualizadas (migração automática)."""
+       ou com apóstrofo batem com dd/mm/aaaa novas."""
     if not rows:
         return
 
@@ -672,6 +681,14 @@ ws_movimentacao = get_or_create_ws(sh, ABA_MOVIMENTACAO, cabecalho_movimentacao)
 ws_leads_novos = get_or_create_ws(sh, ABA_LEADS_NOVOS, cabecalho_leads_novos)
 ws_tempo_resposta = get_or_create_ws(sh, ABA_TEMPO_RESPOSTA, cabecalho_tempo_resposta)
 ws_log_leads = get_or_create_ws(sh, ABA_LOG_LEADS, cabecalho_log_leads)
+
+# Trava a coluna A (data/chave) como TEXTO em todas as abas — substitui o
+# antigo truque do apóstrofo. Sem isso, o Sheets reformata '01/08/2026'
+# como data nativa e a comparação de chave do upsert quebra na rodada
+# seguinte. Idempotente: aplicar de novo não muda nada.
+for ws in (ws_pessoa, ws_bruto, ws_mix, ws_movimentacao,
+           ws_leads_novos, ws_tempo_resposta, ws_log_leads):
+    _travar_coluna_data_como_texto(ws)
 
 
 # ============================================================
