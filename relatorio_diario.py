@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 import pytz
 from datetime import datetime, timedelta, time
+from calendar import monthrange
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -17,6 +18,14 @@ SUBDOMINIO = os.environ["KOMMO_SUBDOMAIN"]
 TOKEN = os.environ["KOMMO_TOKEN"]
 SHEET_ID = os.environ["SHEET_ID"]
 GOOGLE_CREDS = os.environ["GOOGLE_CREDENTIALS"]
+
+# Modo retroativo — quando MES e ANO vêm preenchidos pelo workflow_dispatch
+# (botão "Run workflow" no Actions), o script processa dia-a-dia o mês
+# inteiro em vez de rodar só hoje. A automação normal (cron) NÃO passa
+# essas variáveis, então continua funcionando exatamente igual.
+MES_ENV = os.environ.get("MES", "").strip()
+ANO_ENV = os.environ.get("ANO", "").strip()
+MODO_RETROATIVO = bool(MES_ENV and ANO_ENV)
 
 BASE_URL = f"https://{SUBDOMINIO}.kommo.com/api/v4"
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
@@ -37,6 +46,36 @@ ABA_LOG_LEADS = "Log de Movimentação de Leads"
 # veja o print "Campos identificados como agendamento" no início da execução
 # e ajuste esta lista com o nome exato do campo cadastrado no Kommo.
 PALAVRAS_CHAVE_AGENDAMENTO = ["agendamento", "consulta marcada", "data e hora", "horário marcado", "atendimento"]
+
+# ============================================================
+# HELPERS DE DATA (formato brasileiro em toda a planilha)
+# ============================================================
+FORMATO_DATA_BR = "%d/%m/%Y"
+FORMATO_DATA_HORA_LOG = "%d/%m/%Y %H:%M"
+
+
+def data_str(d):
+    """Formata data como dd/mm/aaaa — usado como chave na 1a coluna de
+    todas as abas de resumo diário. Antes era str(d) que dava ISO."""
+    return d.strftime(FORMATO_DATA_BR)
+
+
+def _normalizar_chave_data(valor):
+    """Normaliza uma célula-chave que representa uma data pra forma canônica
+    (ISO interna). Aceita tanto '2026-08-01' quanto '01/08/2026'. Isso é
+    usado só na hora de COMPARAR chaves no upsert — permite que linhas
+    antigas gravadas em ISO ainda batam com as novas em dd/mm/aaaa,
+    atualizando (e migrando) a linha existente em vez de duplicar."""
+    if not valor:
+        return valor
+    v = str(valor).strip().lstrip("'")
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
+        try:
+            return datetime.strptime(v, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return v  # não parece data, deixa como está
+
 
 # ============================================================
 # TRADUÇÃO DE TIPOS DE EVENTO (nomes fixos do sistema Kommo)
@@ -89,17 +128,27 @@ def nome_tipo(tipo, campos_personalizados):
 
 
 # ============================================================
-# JANELA: HOJE, da meia-noite até agora (atualiza ao longo do dia)
+# DEFINE OS DIAS A PROCESSAR
 # ============================================================
 agora = datetime.now(TZ)
-hoje = agora.date()
-ts0 = int(TZ.localize(datetime.combine(hoje, time.min)).timestamp())
-ts1 = int(agora.timestamp())
-print(f"Coletando dados de hoje ({hoje}) até {agora.strftime('%H:%M')}")
+
+if MODO_RETROATIVO:
+    mes_num = int(MES_ENV)
+    ano_num = int(ANO_ENV)
+    if not (1 <= mes_num <= 12):
+        raise ValueError(f"Mês inválido: {mes_num}. Use 1 a 12.")
+    ultimo_dia_mes = monthrange(ano_num, mes_num)[1]
+    dias_a_processar = [datetime(ano_num, mes_num, d).date() for d in range(1, ultimo_dia_mes + 1)]
+    # Não processa dias futuros (caso o mês pedido seja o atual, corta em hoje)
+    dias_a_processar = [d for d in dias_a_processar if d <= agora.date()]
+    print(f"MODO RETROATIVO: processando {len(dias_a_processar)} dias de {mes_num:02d}/{ano_num}.")
+else:
+    dias_a_processar = [agora.date()]
+    print(f"Modo automático: processando hoje ({data_str(agora.date())}) até {agora.strftime('%H:%M')}.")
+
 
 # ============================================================
-# COLETA: status E nome de TODOS os pipelines (corrige o bug do "?" e
-# agora também identifica o funil de cada lead, pra coluna 'funil')
+# COLETAS GLOBAIS (uma vez por execução — não mudam por dia)
 # ============================================================
 def get_pipelines_e_status():
     status_map = {}
@@ -186,7 +235,10 @@ def get_usuarios():
 usuarios = get_usuarios()
 
 
-def get_eventos():
+# ============================================================
+# COLETAS POR JANELA DE TEMPO (recebe ts0/ts1 do dia sendo processado)
+# ============================================================
+def get_eventos(ts0, ts1):
     ev, page = [], 1
     while True:
         params = {
@@ -209,7 +261,7 @@ def get_eventos():
     return ev
 
 
-def get_leads_novos():
+def get_leads_novos(ts0, ts1):
     leads, page = [], 1
     while True:
         params = {
@@ -362,71 +414,8 @@ def extrair_horario_agendamento(lead, campos_agendamento):
     return ""
 
 
-eventos = get_eventos()
-print(f"{len(eventos)} eventos coletados hoje até agora.")
-
-leads_novos = get_leads_novos()
-print(f"{len(leads_novos)} leads novos hoje até agora.")
-
-
 # ============================================================
-# LOG DETALHADO: nome, telefone, funil e etapa de cada lead que mudou de
-# etapa hoje — junto com o horário do agendamento, quando existir
-# ============================================================
-mudancas_etapa = [
-    e for e in eventos
-    if e.get("type") == "lead_status_changed" and e.get("entity_type") == "lead"
-]
-lead_ids_hoje = {e.get("entity_id") for e in mudancas_etapa}
-
-leads_info = get_leads_por_id(lead_ids_hoje)
-contato_ids_hoje = {contato_principal_id(lead) for lead in leads_info.values()}
-contatos_info = get_contatos_por_id(contato_ids_hoje)
-
-log_leads_rows = []
-for e in mudancas_etapa:
-    lead_id = e.get("entity_id")
-    lead = leads_info.get(lead_id, {})
-    contato = contatos_info.get(contato_principal_id(lead), {})
-
-    uid = e.get("created_by", 0)
-    responsavel = usuarios.get(uid, f"User {uid}")
-
-    status_depois_id = status_antes_id = None
-    try:
-        status_depois_id = e["value_after"][0]["lead_status"]["id"]
-    except (IndexError, KeyError, TypeError):
-        pass
-    try:
-        status_antes_id = e["value_before"][0]["lead_status"]["id"]
-    except (IndexError, KeyError, TypeError):
-        pass
-
-    etapa_destino = STATUS.get(status_depois_id, "Etapa não identificada")
-    etapa_anterior = STATUS.get(status_antes_id, "") if status_antes_id else ""
-    funil = PIPELINE_NOMES.get(lead.get("pipeline_id"), "Funil não identificado")
-    dt_evento = datetime.fromtimestamp(e["created_at"], TZ)
-
-    log_leads_rows.append(
-        [
-            str(e["id"]),
-            dt_evento.strftime("%d/%m/%Y %H:%M"),
-            str(lead_id),
-            lead.get("name", ""),
-            extrair_telefone(contato),
-            funil,
-            etapa_destino,
-            etapa_anterior,
-            responsavel,
-            extrair_horario_agendamento(lead, CAMPOS_AGENDAMENTO),
-        ]
-    )
-
-print(f"{len(log_leads_rows)} mudanças de etapa detalhadas hoje (nome, telefone, funil e agendamento).")
-
-
-# ============================================================
-# TEMPO DE RESPOSTA: primeira resposta de cada lead + média geral
+# TEMPO DE RESPOSTA
 # ============================================================
 def calcular_tempos_resposta(eventos, usuarios):
     """Retorna duas listas de (nome_pessoa, minutos):
@@ -480,107 +469,9 @@ def dentro_do_horario_comercial(e):
     return HORA_INICIO_COMERCIAL <= dt.hour < HORA_FIM_COMERCIAL
 
 
-eventos_horario_comercial = [e for e in eventos if dentro_do_horario_comercial(e)]
-
-primeira_resposta, toda_resposta = calcular_tempos_resposta(eventos_horario_comercial, usuarios)
-print(
-    f"{len(primeira_resposta)} primeiras respostas e {len(toda_resposta)} respostas hoje no total "
-    f"(considerando só mensagens entre {HORA_INICIO_COMERCIAL}h e {HORA_FIM_COMERCIAL}h) — "
-    f"a aba 'Tempo de Resposta' grava só o delta desde o último lançamento, calculado mais abaixo."
-)
-
-linhas = []
-for e in eventos:
-    uid = e.get("created_by", 0)
-    nome = usuarios.get(uid, f"User {uid}")
-    tipo_bruto = e.get("type", "?")
-    tipo = nome_tipo(tipo_bruto, CAMPOS_PERSONALIZADOS)
-    entity_type = e.get("entity_type", "?")
-    entity_id = e.get("entity_id")
-    destino = None
-    if tipo_bruto == "lead_status_changed":
-        try:
-            status_id = e["value_after"][0]["lead_status"]["id"]
-            destino = STATUS.get(status_id, "Etapa não identificada")
-        except (IndexError, KeyError, TypeError):
-            destino = "Etapa não identificada"
-    linhas.append(
-        {
-            "usuario": nome,
-            "tipo_bruto": tipo_bruto,
-            "tipo": tipo,
-            "entity_type": entity_type,
-            "entity_id": entity_id,
-            "destino_etapa": destino,
-        }
-    )
-
-df = pd.DataFrame(linhas)
-if not df.empty:
-    df = df[df["usuario"] != "User 0"]
-
 # ============================================================
-# RESUMOS (sempre o total acumulado de HOJE, do zero até agora)
+# ESCRITA NO GOOGLE SHEETS — helpers
 # ============================================================
-resumo_pessoa_rows = []
-resumo_bruto_row = [str(hoje), 0, 0, 0, 0, 0]
-mix_rows = []
-movimentacao_rows = []
-
-if not df.empty:
-    foco_df = df[df.usuario.isin(FOCO)]
-    mov = foco_df[foco_df.tipo_bruto == "lead_status_changed"]
-
-    acoes_totais = foco_df.groupby("usuario").size()
-    leads_df = foco_df[foco_df.entity_type == "lead"]
-    leads_unicos = leads_df.groupby("usuario")["entity_id"].nunique()
-
-    agendou = mov[mov.destino_etapa == "Agendamento Marcado"].groupby("usuario").size()
-    compareceu = mov[mov.destino_etapa == "Compareceu (Ganho)"].groupby("usuario").size()
-    faltou = mov[mov.destino_etapa == "Faltou (No Show)"].groupby("usuario").size()
-
-    for pessoa in FOCO:
-        resumo_pessoa_rows.append(
-            [
-                str(hoje),
-                pessoa,
-                int(leads_unicos.get(pessoa, 0)),
-                int(acoes_totais.get(pessoa, 0)),
-                int(agendou.get(pessoa, 0)),
-                int(compareceu.get(pessoa, 0)),
-                int(faltou.get(pessoa, 0)),
-            ]
-        )
-
-    resumo_bruto_row = [
-        str(hoje),
-        int(leads_unicos.sum()),
-        int(acoes_totais.sum()),
-        int(agendou.sum()),
-        int(compareceu.sum()),
-        int(faltou.sum()),
-    ]
-
-    if not foco_df.empty:
-        mix_counts = foco_df.groupby(["usuario", "tipo"]).size()
-        for (pessoa, tipo), qtd in mix_counts.items():
-            mix_rows.append([str(hoje), pessoa, tipo, int(qtd)])
-
-    if not mov.empty:
-        mov_counts = mov.groupby(["usuario", "destino_etapa"]).size()
-        for (pessoa, etapa), qtd in mov_counts.items():
-            movimentacao_rows.append([str(hoje), pessoa, etapa, int(qtd)])
-else:
-    for pessoa in FOCO:
-        resumo_pessoa_rows.append([str(hoje), pessoa, 0, 0, 0, 0, 0])
-
-leads_novos_row = [str(hoje), len(leads_novos)]
-
-# ============================================================
-# ESCREVE NO GOOGLE SHEETS — UPSERT (atualiza a linha de hoje, não duplica)
-# ============================================================
-
-
 def get_or_create_ws(sh, titulo, cabecalho):
     try:
         ws = sh.worksheet(titulo)
@@ -603,10 +494,9 @@ def col_letter(n):
 def texto_sheets(valor):
     """Prefixo de apóstrofo força o Google Sheets a gravar como TEXTO puro
     (mesmo truque já usado em extrair_telefone) — evita que uma data como
-    '2026-07-13' seja reinterpretada e reformatada (ex: 'segunda-feira, 13
-    de julho de 2026'), o que quebrava a comparação de chave a cada nova
-    rodada. O apóstrofo não aparece no valor exibido nem no que é lido de
-    volta com get_all_values()."""
+    '01/08/2026' seja reinterpretada e reformatada, o que quebrava a
+    comparação de chave a cada nova rodada. O apóstrofo não aparece no
+    valor exibido nem no que é lido de volta com get_all_values()."""
     return f"'{valor}"
 
 
@@ -618,9 +508,19 @@ def _forcar_texto_na_data(row):
     return nova
 
 
+def _chave_normalizada(valores, key_cols_count):
+    """Constrói a tupla-chave normalizando a 1a coluna (data) — assim linhas
+    antigas gravadas em ISO ('2026-08-01') ainda batem com as novas em
+    dd/mm/aaaa ('01/08/2026'), migrando o histórico em vez de duplicar."""
+    partes = [str(v) for v in valores[:key_cols_count]]
+    if partes:
+        partes[0] = _normalizar_chave_data(partes[0])
+    return tuple(partes)
+
+
 def upsert_rows(ws, key_cols_count, rows):
     """Atualiza linhas cuja chave (primeiras `key_cols_count` colunas) já existe;
-    cria linha nova quando a chave ainda não apareceu hoje.
+    cria linha nova quando a chave ainda não apareceu.
 
     Três cuidados pra não estourar a cota de escrita do Google Sheets nem
     quebrar a comparação de chave:
@@ -629,7 +529,9 @@ def upsert_rows(ws, key_cols_count, rows):
     2) Se o conteúdo da linha já é idêntico ao que está na planilha, não
        escreve nada (a maioria dos eventos antigos do log não muda mais).
     3) As atualizações que sobrarem vão todas num único batch_update, em
-       vez de uma chamada de API por linha."""
+       vez de uma chamada de API por linha.
+    4) A comparação de chave usa _chave_normalizada — datas em ISO antigas
+       batem com dd/mm/aaaa novas e são atualizadas (migração automática)."""
     if not rows:
         return
 
@@ -639,14 +541,14 @@ def upsert_rows(ws, key_cols_count, rows):
     chave_para_linha = {}
     chave_para_valores = {}
     for i, linha_existente in enumerate(corpo):
-        chave = tuple(linha_existente[:key_cols_count])
+        chave = _chave_normalizada(linha_existente, key_cols_count)
         chave_para_linha[chave] = i + 2
         chave_para_valores[chave] = linha_existente
 
     atualizacoes = []
     novas = []
     for row in rows:
-        chave = tuple(str(v) for v in row[:key_cols_count])
+        chave = _chave_normalizada(row, key_cols_count)
         row_str = [str(v) for v in row]
         if chave in chave_para_linha:
             existente = chave_para_valores.get(chave, [])
@@ -672,25 +574,28 @@ def upsert_rows(ws, key_cols_count, rows):
         ws.append_rows(novas_texto, value_input_option="USER_ENTERED")
 
 
-def gravar_delta_log(ws, key_cols_count, rows_cumulativos_hoje):
+def gravar_delta_log(ws, key_cols_count, rows_cumulativos_dia, dia):
     """Pra métricas que devem virar um LOG (várias linhas por dia, uma por
     rodada) em vez de upsert: grava só a diferença desde o último
-    lançamento de hoje. Soma o que já foi logado hoje pra cada chave,
-    subtrai do valor cumulativo atual (calculado desde a meia-noite), e
-    acrescenta uma linha nova só com o delta. Some as linhas na planilha
-    pra ter o total do dia — sem risco de contar o mesmo evento 2x."""
-    if not rows_cumulativos_hoje:
+    lançamento do dia processado. Soma o que já foi logado hoje pra cada
+    chave, subtrai do valor cumulativo atual, e acrescenta uma linha nova
+    só com o delta. Some as linhas na planilha pra ter o total do dia —
+    sem risco de contar o mesmo evento 2x. Funciona no modo retroativo
+    também: se já rodou pro dia 15/05, a 2a execução não duplica."""
+    if not rows_cumulativos_dia:
         return
 
     existentes = ws.get_all_values()
     corpo = existentes[1:] if len(existentes) > 1 else []
-    hoje_str = str(hoje)
+    dia_canonico = _normalizar_chave_data(data_str(dia))
 
     ja_logado_hoje = {}
     for linha in corpo:
-        if len(linha) <= key_cols_count or linha[0] != hoje_str:
+        if len(linha) <= key_cols_count:
             continue
-        chave = tuple(linha[:key_cols_count])
+        if _normalizar_chave_data(linha[0]) != dia_canonico:
+            continue
+        chave = _chave_normalizada(linha, key_cols_count)
         try:
             valor = int(linha[key_cols_count])
         except (ValueError, IndexError):
@@ -698,8 +603,8 @@ def gravar_delta_log(ws, key_cols_count, rows_cumulativos_hoje):
         ja_logado_hoje[chave] = ja_logado_hoje.get(chave, 0) + valor
 
     novas = []
-    for row in rows_cumulativos_hoje:
-        chave = tuple(str(v) for v in row[:key_cols_count])
+    for row in rows_cumulativos_dia:
+        chave = _chave_normalizada(row, key_cols_count)
         cumulativo_agora = row[key_cols_count]
         delta = cumulativo_agora - ja_logado_hoje.get(chave, 0)
         if delta > 0:
@@ -712,11 +617,13 @@ def gravar_delta_log(ws, key_cols_count, rows_cumulativos_hoje):
         ws.append_rows(novas, value_input_option="USER_ENTERED")
 
 
-def ultimo_timestamp_logado(ws, formato_data_hora, ts_fallback):
-    """Acha o timestamp (epoch) do último lançamento já gravado numa aba de
-    log incremental (lê só a 1a coluna, no formato `formato_data_hora`).
-    Se não achar nenhuma linha nesse formato ainda, usa `ts_fallback`
-    (meia-noite de hoje) — cobre o primeiro lançamento do dia."""
+def ultimo_timestamp_do_dia(ws, formato_data_hora, dia_alvo, ts_fallback):
+    """Acha o timestamp (epoch) do último lançamento já gravado NO DIA_ALVO
+    numa aba de log incremental (lê só a 1a coluna, no formato
+    `formato_data_hora`). Se não achar nenhuma linha desse dia, usa
+    `ts_fallback` (meia-noite do dia_alvo). Restringir por dia é
+    importante pro modo retroativo: senão pegaríamos o max de outros dias
+    e o filtro subsequente descartaria todos os eventos do dia_alvo."""
     existentes = ws.get_all_values()
     corpo = existentes[1:] if len(existentes) > 1 else []
     maior_ts = None
@@ -724,8 +631,10 @@ def ultimo_timestamp_logado(ws, formato_data_hora, ts_fallback):
         if not linha or not linha[0]:
             continue
         try:
-            dt = TZ.localize(datetime.strptime(linha[0], formato_data_hora))
+            dt = TZ.localize(datetime.strptime(linha[0].lstrip("'"), formato_data_hora))
         except ValueError:
+            continue
+        if dt.date() != dia_alvo:
             continue
         ts = int(dt.timestamp())
         if maior_ts is None or ts > maior_ts:
@@ -733,6 +642,9 @@ def ultimo_timestamp_logado(ws, formato_data_hora, ts_fallback):
     return maior_ts if maior_ts is not None else ts_fallback
 
 
+# ============================================================
+# CONEXÃO GOOGLE SHEETS (uma vez)
+# ============================================================
 scopes = ["https://www.googleapis.com/auth/spreadsheets"]
 creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDS), scopes=scopes)
 gc = gspread.authorize(creds)
@@ -761,60 +673,239 @@ ws_leads_novos = get_or_create_ws(sh, ABA_LEADS_NOVOS, cabecalho_leads_novos)
 ws_tempo_resposta = get_or_create_ws(sh, ABA_TEMPO_RESPOSTA, cabecalho_tempo_resposta)
 ws_log_leads = get_or_create_ws(sh, ABA_LOG_LEADS, cabecalho_log_leads)
 
+
 # ============================================================
-# TEMPO DE RESPOSTA — vira log incremental: cada linha traz DATA+HORA do
-# lançamento e as estatísticas de só o período desde o lançamento anterior
-# (não mais o acumulado do dia inteiro). Isso deixa claro a que janela de
-# tempo cada linha se refere, e você soma/pondera na planilha como quiser.
+# PROCESSAMENTO POR DIA
 # ============================================================
-FORMATO_DATA_HORA_LOG = "%d/%m/%Y %H:%M"
-ultimo_log_ts_resposta = ultimo_timestamp_logado(ws_tempo_resposta, FORMATO_DATA_HORA_LOG, ts_fallback=ts0)
-eventos_desde_ultimo_log = [e for e in eventos_horario_comercial if e["created_at"] > ultimo_log_ts_resposta]
+def processar_dia(dia):
+    """Processa um dia (hoje em andamento OU um dia retroativo completo) e
+    grava tudo nas abas. No modo automático, a janela vai da meia-noite
+    até agora. No modo retroativo (ou qualquer dia < hoje), a janela vai
+    da meia-noite até 23:59:59."""
+    ts0 = int(TZ.localize(datetime.combine(dia, time.min)).timestamp())
 
-primeira_resposta_janela, toda_resposta_janela = calcular_tempos_resposta(eventos_desde_ultimo_log, usuarios)
+    if dia < agora.date():
+        # Dia já passado — janela do dia inteiro
+        ts1 = int(TZ.localize(datetime.combine(dia, time.max)).timestamp())
+        momento_ref = TZ.localize(datetime.combine(dia, time(23, 59)))
+        rotulo_janela = f"{data_str(dia)} (dia completo)"
+    else:
+        # Hoje em andamento
+        ts1 = int(agora.timestamp())
+        momento_ref = agora
+        rotulo_janela = f"{data_str(dia)} até {agora.strftime('%H:%M')}"
 
-primeira_por_pessoa_janela = {}
-toda_por_pessoa_janela = {}
-for nome, delta in primeira_resposta_janela:
-    if nome in FOCO:
-        primeira_por_pessoa_janela.setdefault(nome, []).append(delta)
-for nome, delta in toda_resposta_janela:
-    if nome in FOCO:
-        toda_por_pessoa_janela.setdefault(nome, []).append(delta)
+    dia_str = data_str(dia)
+    print(f"\n=== Processando {rotulo_janela} ===")
 
-data_hora_log = agora.strftime(FORMATO_DATA_HORA_LOG)
-tempo_resposta_rows = []
-for pessoa in FOCO:
-    prim = primeira_por_pessoa_janela.get(pessoa, [])
-    tod = toda_por_pessoa_janela.get(pessoa, [])
-    if not prim and not tod:
-        continue  # nada de novo pra essa pessoa desde o último lançamento -> não grava linha vazia
-    tempo_resposta_rows.append(
-        [
-            data_hora_log,
-            pessoa,
-            round(sum(prim) / len(prim), 1) if prim else 0,
-            len(prim),
-            round(sum(tod) / len(tod), 1) if tod else 0,
-            len(tod),
+    eventos = get_eventos(ts0, ts1)
+    print(f"  {len(eventos)} eventos coletados.")
+
+    leads_novos = get_leads_novos(ts0, ts1)
+    print(f"  {len(leads_novos)} leads novos.")
+
+    # -------- LOG detalhado de mudanças de etapa --------
+    mudancas_etapa = [
+        e for e in eventos
+        if e.get("type") == "lead_status_changed" and e.get("entity_type") == "lead"
+    ]
+    lead_ids_no_dia = {e.get("entity_id") for e in mudancas_etapa}
+
+    leads_info = get_leads_por_id(lead_ids_no_dia)
+    contato_ids_no_dia = {contato_principal_id(lead) for lead in leads_info.values()}
+    contatos_info = get_contatos_por_id(contato_ids_no_dia)
+
+    log_leads_rows = []
+    for e in mudancas_etapa:
+        lead_id = e.get("entity_id")
+        lead = leads_info.get(lead_id, {})
+        contato = contatos_info.get(contato_principal_id(lead), {})
+
+        uid = e.get("created_by", 0)
+        responsavel = usuarios.get(uid, f"User {uid}")
+
+        status_depois_id = status_antes_id = None
+        try:
+            status_depois_id = e["value_after"][0]["lead_status"]["id"]
+        except (IndexError, KeyError, TypeError):
+            pass
+        try:
+            status_antes_id = e["value_before"][0]["lead_status"]["id"]
+        except (IndexError, KeyError, TypeError):
+            pass
+
+        etapa_destino = STATUS.get(status_depois_id, "Etapa não identificada")
+        etapa_anterior = STATUS.get(status_antes_id, "") if status_antes_id else ""
+        funil = PIPELINE_NOMES.get(lead.get("pipeline_id"), "Funil não identificado")
+        dt_evento = datetime.fromtimestamp(e["created_at"], TZ)
+
+        log_leads_rows.append(
+            [
+                str(e["id"]),
+                dt_evento.strftime(FORMATO_DATA_HORA_LOG),
+                str(lead_id),
+                lead.get("name", ""),
+                extrair_telefone(contato),
+                funil,
+                etapa_destino,
+                etapa_anterior,
+                responsavel,
+                extrair_horario_agendamento(lead, CAMPOS_AGENDAMENTO),
+            ]
+        )
+
+    print(f"  {len(log_leads_rows)} mudanças de etapa detalhadas.")
+
+    # -------- Tempo de resposta (só horário comercial) --------
+    eventos_horario_comercial = [e for e in eventos if dentro_do_horario_comercial(e)]
+
+    ultimo_log_ts_resposta = ultimo_timestamp_do_dia(
+        ws_tempo_resposta, FORMATO_DATA_HORA_LOG, dia_alvo=dia, ts_fallback=ts0
+    )
+    eventos_desde_ultimo_log = [
+        e for e in eventos_horario_comercial if e["created_at"] > ultimo_log_ts_resposta
+    ]
+    primeira_resposta_janela, toda_resposta_janela = calcular_tempos_resposta(
+        eventos_desde_ultimo_log, usuarios
+    )
+
+    primeira_por_pessoa_janela = {}
+    toda_por_pessoa_janela = {}
+    for nome, delta in primeira_resposta_janela:
+        if nome in FOCO:
+            primeira_por_pessoa_janela.setdefault(nome, []).append(delta)
+    for nome, delta in toda_resposta_janela:
+        if nome in FOCO:
+            toda_por_pessoa_janela.setdefault(nome, []).append(delta)
+
+    data_hora_log = momento_ref.strftime(FORMATO_DATA_HORA_LOG)
+    tempo_resposta_rows = []
+    for pessoa in FOCO:
+        prim = primeira_por_pessoa_janela.get(pessoa, [])
+        tod = toda_por_pessoa_janela.get(pessoa, [])
+        if not prim and not tod:
+            continue  # nada de novo pra essa pessoa desde o último lançamento
+        tempo_resposta_rows.append(
+            [
+                data_hora_log,
+                pessoa,
+                round(sum(prim) / len(prim), 1) if prim else 0,
+                len(prim),
+                round(sum(tod) / len(tod), 1) if tod else 0,
+                len(tod),
+            ]
+        )
+
+    if tempo_resposta_rows:
+        ws_tempo_resposta.append_rows(
+            [_forcar_texto_na_data(r) for r in tempo_resposta_rows],
+            value_input_option="USER_ENTERED",
+        )
+    print(
+        f"  {len(tempo_resposta_rows)} linha(s) de tempo de resposta gravadas "
+        f"(janela desde {datetime.fromtimestamp(ultimo_log_ts_resposta, TZ).strftime(FORMATO_DATA_HORA_LOG)})."
+    )
+
+    # -------- Resumos do dia --------
+    linhas = []
+    for e in eventos:
+        uid = e.get("created_by", 0)
+        nome = usuarios.get(uid, f"User {uid}")
+        tipo_bruto = e.get("type", "?")
+        tipo = nome_tipo(tipo_bruto, CAMPOS_PERSONALIZADOS)
+        entity_type = e.get("entity_type", "?")
+        entity_id = e.get("entity_id")
+        destino = None
+        if tipo_bruto == "lead_status_changed":
+            try:
+                status_id = e["value_after"][0]["lead_status"]["id"]
+                destino = STATUS.get(status_id, "Etapa não identificada")
+            except (IndexError, KeyError, TypeError):
+                destino = "Etapa não identificada"
+        linhas.append(
+            {
+                "usuario": nome,
+                "tipo_bruto": tipo_bruto,
+                "tipo": tipo,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "destino_etapa": destino,
+            }
+        )
+
+    df = pd.DataFrame(linhas)
+    if not df.empty:
+        df = df[df["usuario"] != "User 0"]
+
+    resumo_pessoa_rows = []
+    resumo_bruto_row = [dia_str, 0, 0, 0, 0, 0]
+    mix_rows = []
+    movimentacao_rows = []
+
+    if not df.empty:
+        foco_df = df[df.usuario.isin(FOCO)]
+        mov = foco_df[foco_df.tipo_bruto == "lead_status_changed"]
+
+        acoes_totais = foco_df.groupby("usuario").size()
+        leads_df = foco_df[foco_df.entity_type == "lead"]
+        leads_unicos = leads_df.groupby("usuario")["entity_id"].nunique()
+
+        agendou = mov[mov.destino_etapa == "Agendamento Marcado"].groupby("usuario").size()
+        compareceu = mov[mov.destino_etapa == "Compareceu (Ganho)"].groupby("usuario").size()
+        faltou = mov[mov.destino_etapa == "Faltou (No Show)"].groupby("usuario").size()
+
+        for pessoa in FOCO:
+            resumo_pessoa_rows.append(
+                [
+                    dia_str,
+                    pessoa,
+                    int(leads_unicos.get(pessoa, 0)),
+                    int(acoes_totais.get(pessoa, 0)),
+                    int(agendou.get(pessoa, 0)),
+                    int(compareceu.get(pessoa, 0)),
+                    int(faltou.get(pessoa, 0)),
+                ]
+            )
+
+        resumo_bruto_row = [
+            dia_str,
+            int(leads_unicos.sum()),
+            int(acoes_totais.sum()),
+            int(agendou.sum()),
+            int(compareceu.sum()),
+            int(faltou.sum()),
         ]
-    )
 
-if tempo_resposta_rows:
-    ws_tempo_resposta.append_rows(
-        [_forcar_texto_na_data(r) for r in tempo_resposta_rows],
-        value_input_option="USER_ENTERED",
-    )
-print(
-    f"{len(tempo_resposta_rows)} linha(s) de tempo de resposta gravadas "
-    f"(janela desde {datetime.fromtimestamp(ultimo_log_ts_resposta, TZ).strftime(FORMATO_DATA_HORA_LOG)})."
-)
+        if not foco_df.empty:
+            mix_counts = foco_df.groupby(["usuario", "tipo"]).size()
+            for (pessoa, tipo), qtd in mix_counts.items():
+                mix_rows.append([dia_str, pessoa, tipo, int(qtd)])
 
-upsert_rows(ws_pessoa, key_cols_count=2, rows=resumo_pessoa_rows)
-upsert_rows(ws_bruto, key_cols_count=1, rows=[resumo_bruto_row])
-gravar_delta_log(ws_mix, key_cols_count=3, rows_cumulativos_hoje=mix_rows)
-upsert_rows(ws_movimentacao, key_cols_count=3, rows=movimentacao_rows)
-upsert_rows(ws_leads_novos, key_cols_count=1, rows=[leads_novos_row])
-upsert_rows(ws_log_leads, key_cols_count=1, rows=log_leads_rows)
+        if not mov.empty:
+            mov_counts = mov.groupby(["usuario", "destino_etapa"]).size()
+            for (pessoa, etapa), qtd in mov_counts.items():
+                movimentacao_rows.append([dia_str, pessoa, etapa, int(qtd)])
+    else:
+        for pessoa in FOCO:
+            resumo_pessoa_rows.append([dia_str, pessoa, 0, 0, 0, 0, 0])
 
-print(f"Atualizado com sucesso às {agora.strftime('%H:%M')} de {hoje}.")
+    leads_novos_row = [dia_str, len(leads_novos)]
+
+    # -------- Grava tudo --------
+    upsert_rows(ws_pessoa, key_cols_count=2, rows=resumo_pessoa_rows)
+    upsert_rows(ws_bruto, key_cols_count=1, rows=[resumo_bruto_row])
+    gravar_delta_log(ws_mix, key_cols_count=3, rows_cumulativos_dia=mix_rows, dia=dia)
+    upsert_rows(ws_movimentacao, key_cols_count=3, rows=movimentacao_rows)
+    upsert_rows(ws_leads_novos, key_cols_count=1, rows=[leads_novos_row])
+    upsert_rows(ws_log_leads, key_cols_count=1, rows=log_leads_rows)
+
+    print(f"  ✓ {dia_str} atualizado.")
+
+
+# ============================================================
+# LOOP PRINCIPAL
+# ============================================================
+for dia in dias_a_processar:
+    processar_dia(dia)
+
+print(f"\nExecução finalizada às {datetime.now(TZ).strftime('%H:%M')} de {data_str(agora.date())}.")
