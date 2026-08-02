@@ -7,7 +7,17 @@ on:
     # horário de pico que todo cron do mundo usa nos minutos redondos —
     # o GitHub avisa que agendamentos em pico podem atrasar ou ser descartados.
     - cron: '7,22,37,52 10-22 * * *'
-  workflow_dispatch:  # permite rodar manualmente pelo botão também
+
+  workflow_dispatch:
+    inputs:
+      mes:
+        description: 'Mês retroativo (1-12). Deixe vazio para rodar normal (hoje).'
+        required: false
+        default: ''
+      ano:
+        description: 'Ano retroativo (ex: 2026). Deixe vazio para rodar normal (hoje).'
+        required: false
+        default: ''
 
 jobs:
   rodar:
@@ -28,4 +38,6 @@ jobs:
           KOMMO_TOKEN: ${{ secrets.KOMMO_TOKEN }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          MES: ${{ github.event.inputs.mes }}
+          ANO: ${{ github.event.inputs.ano }}
         run: python relatorio_diario.py
