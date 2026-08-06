@@ -7,6 +7,7 @@ import pandas as pd
 import pytz
 from datetime import datetime, timedelta, time
 from calendar import monthrange
+from time import sleep
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -75,6 +76,18 @@ def _normalizar_chave_data(valor):
             return datetime.strptime(v, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
+    # Rede de segurança: se a célula veio como NÚMERO SERIAL do Sheets
+    # (ex.: '46164' — uma data real cuja formatação de data se perdeu),
+    # converte de volta pra ISO. Sem isso, a chave "46164" nunca bateria
+    # com "22/05/2026" e o upsert duplicaria a linha. Epoch do Sheets =
+    # 1899-12-30 (dia 0). Só aceita a faixa plausível de datas (1900–2173)
+    # pra não confundir com um número comum que por acaso caia numa 1a coluna.
+    try:
+        serial = float(v)
+        if 1 <= serial <= 100000:
+            return (datetime(1899, 12, 30) + timedelta(days=int(serial))).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        pass
     return v  # não parece data, deixa como está
 
 
@@ -507,15 +520,48 @@ def _forcar_texto_na_data(row):
 
 
 def _travar_coluna_data_como_texto(ws):
-    """Formata a coluna A da aba como 'Texto puro' (numberFormat=TEXT). Isso
-    impede o Sheets de reinterpretar '01/08/2026' como data nativa e
-    reformatar a célula — que era o motivo original do apóstrofo. Roda
-    uma vez por aba, no início da execução; idempotente (aplicar de novo
-    não muda nada)."""
+    """Formata a coluna A da aba como 'Texto puro' (numberFormat=TEXT). Usado
+    só nas abas cuja coluna A NÃO é data (ex.: 'evento_id' no Log). Roda uma
+    vez por aba; idempotente."""
     try:
         ws.format("A:A", {"numberFormat": {"type": "TEXT"}})
     except Exception as e:
         print(f"  aviso: não consegui travar coluna A de '{ws.title}' como texto: {e}")
+
+
+def _formatar_coluna_como_data(ws, pattern="dd/mm/yyyy", com_hora=False):
+    """Formata a coluna A da aba como DATA REAL (numberFormat=DATE), NÃO como
+    texto. Consequências:
+      - datas gravadas em ISO viram valores de data de verdade -> CONT.SES,
+        SOMASES, QUERY, SEQ e qualquer filtro por data passam a funcionar;
+      - células que hoje exibem o número serial (ex.: 46164) voltam a exibir
+        dd/mm/aaaa SOZINHAS — o valor por baixo já é uma data real, só faltava
+        o formato. Ou seja: rodar o script uma vez já cura o histórico dessas
+        células, sem migração manual.
+
+    Por que o serial aparecia: a versão anterior *travava* a coluna como TEXTO.
+    Aplicar TEXTO numa célula que já contém um valor de data faz o Sheets
+    exibir o número cru por baixo (46164) — o travamento era a própria causa
+    do sintoma, não a cura.
+
+    Faz retry porque erro de cota (429) era o que derrubava a formatação em
+    silêncio antes. Se ainda assim falhar, avisa alto — mas não é fatal: a
+    normalização de chave já entende serial, então nenhum dado duplica; no
+    máximo a célula exibe o serial até a próxima rodada consertar."""
+    if com_hora:
+        cell_format = {"numberFormat": {"type": "DATE_TIME", "pattern": pattern}}
+    else:
+        cell_format = {"numberFormat": {"type": "DATE", "pattern": pattern}}
+    for tentativa in range(3):
+        try:
+            ws.format("A:A", cell_format)
+            return
+        except Exception as e:
+            if tentativa == 2:
+                print(f"  AVISO: não formatei coluna A de '{ws.title}' como data ({e}). "
+                      f"Células podem exibir serial até a próxima rodada; dados intactos.")
+            else:
+                sleep(1.5)
 
 
 def _chave_normalizada(valores, key_cols_count):
@@ -682,13 +728,19 @@ ws_leads_novos = get_or_create_ws(sh, ABA_LEADS_NOVOS, cabecalho_leads_novos)
 ws_tempo_resposta = get_or_create_ws(sh, ABA_TEMPO_RESPOSTA, cabecalho_tempo_resposta)
 ws_log_leads = get_or_create_ws(sh, ABA_LOG_LEADS, cabecalho_log_leads)
 
-# Trava a coluna A (data/chave) como TEXTO em todas as abas — substitui o
-# antigo truque do apóstrofo. Sem isso, o Sheets reformata '01/08/2026'
-# como data nativa e a comparação de chave do upsert quebra na rodada
-# seguinte. Idempotente: aplicar de novo não muda nada.
-for ws in (ws_pessoa, ws_bruto, ws_mix, ws_movimentacao,
-           ws_leads_novos, ws_tempo_resposta, ws_log_leads):
-    _travar_coluna_data_como_texto(ws)
+# Coluna A das abas de resumo diário = DATA real (dd/mm/aaaa). Isso conserta o
+# sintoma do número serial E habilita fórmulas de data (CONT.SES/SOMASES/QUERY).
+# A chave do upsert continua batendo porque _normalizar_chave_data lê o valor
+# exibido (dd/mm/aaaa) e o normaliza — e ainda entende serial como salvaguarda.
+for ws in (ws_pessoa, ws_bruto, ws_mix, ws_movimentacao, ws_leads_novos):
+    _formatar_coluna_como_data(ws, pattern="dd/mm/yyyy")
+
+# 'Tempo de Resposta' e 'Log de Movimentação': coluna A é data-hora de texto
+# (lançamento) ou 'evento_id' — nenhuma das duas é a coluna-data das fórmulas,
+# e sempre foram gravadas como texto sem sintoma de serial. Mantidas como texto
+# pra não mexer no que já funciona (ex.: parsing em ultimo_timestamp_do_dia).
+_travar_coluna_data_como_texto(ws_tempo_resposta)
+_travar_coluna_data_como_texto(ws_log_leads)
 
 
 # ============================================================
@@ -712,7 +764,11 @@ def processar_dia(dia):
         momento_ref = agora
         rotulo_janela = f"{data_str(dia)} até {agora.strftime('%H:%M')}"
 
-    dia_str = data_str(dia)
+    # ISO na célula: o Sheets parseia '2026-05-22' como data real em QUALQUER
+    # idioma de planilha (dd/mm/aaaa dependeria do locale e viraria texto no
+    # en_US). O formato da coluna A exibe dd/mm/aaaa. A chave do upsert continua
+    # batendo: _normalizar_chave_data entende ISO, dd/mm/aaaa e serial.
+    dia_str = dia.strftime("%Y-%m-%d")
     print(f"\n=== Processando {rotulo_janela} ===")
 
     eventos = get_eventos(ts0, ts1)
@@ -916,7 +972,7 @@ def processar_dia(dia):
     upsert_rows(ws_leads_novos, key_cols_count=1, rows=[leads_novos_row])
     upsert_rows(ws_log_leads, key_cols_count=1, rows=log_leads_rows)
 
-    print(f"  ✓ {dia_str} atualizado.")
+    print(f"  ✓ {data_str(dia)} atualizado.")
 
 
 # ============================================================
